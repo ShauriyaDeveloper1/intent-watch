@@ -1,0 +1,50 @@
+{
+    "python-envs.pythonProjects": [],
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.py[cod]": true,
+        "**/.pytest_cache": true,
+        "**/.mypy_cache": true,
+        "**/.ruff_cache": true,
+        "**/.cache": true,
+        "**/node_modules": true,
+        "**/dist": true,
+        "**/build": true,
+        "**/.vite": true,
+        "**/venv": true,
+        "**/.venv": true,
+        "**/logs": true,
+        "**/*.log": true,
+        "alerts.db": true
+    },
+    "search.exclude": {
+        "**/__pycache__": true,
+        "**/*.py[cod]": true,
+        "**/.pytest_cache": true,
+        "**/.mypy_cache": true,
+        "**/.ruff_cache": true,
+        "**/.cache": true,
+        "**/node_modules": true,
+        "**/dist": true,
+        "**/build": true,
+        "**/.vite": true,
+        "**/venv": true,
+        "**/.venv": true,
+        "**/logs": true,
+        "**/*.log": true
+    },
+    "files.watcherExclude": {
+        "**/__pycache__/**": true,
+        "**/.pytest_cache/**": true,
+        "**/.mypy_cache/**": true,
+        "**/.ruff_cache/**": true,
+        "**/.cache/**": true,
+        "**/node_modules/**": true,
+        "**/dist/**": true,
+        "**/build/**": true,
+        "**/.vite/**": true,
+        "**/venv/**": true,
+        "**/.venv/**": true,
+        "**/logs/**": true
+    }
+}
