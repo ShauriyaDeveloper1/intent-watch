@@ -4,10 +4,22 @@
 Write-Host "Starting IntentWatch Backend..." -ForegroundColor Cyan
 Write-Host ""
 
-# Activate virtual environment
-if (Test-Path ".\venv\Scripts\Activate.ps1") {
-    Write-Host "Activating virtual environment..." -ForegroundColor Yellow
-    & .\venv\Scripts\Activate.ps1
+# Activate virtual environment (support both ./venv and ./.venv)
+$VenvDir = $null
+if (Test-Path ".\.venv\Scripts\Activate.ps1") {
+    $VenvDir = ".\.venv"
+} elseif (Test-Path ".\venv\Scripts\Activate.ps1") {
+    $VenvDir = ".\venv"
+}
+
+$VenvRoot = $null
+
+if ($VenvDir) {
+    Write-Host "Activating virtual environment ($VenvDir)..." -ForegroundColor Yellow
+    & (Join-Path $VenvDir "Scripts\Activate.ps1")
+
+    # Resolve to an absolute path so later Push-Location doesn't break venv lookups.
+    $VenvRoot = (Resolve-Path $VenvDir).Path
 } else {
     Write-Host "Error: Virtual environment not found!" -ForegroundColor Red
     Write-Host "Please create a virtual environment first with: python -m venv venv" -ForegroundColor Yellow
@@ -96,7 +108,8 @@ if (-Not $env:INTENTWATCH_WEAPON_MODEL_PATH) {
 Push-Location backend
 try {
     # Avoid --reload on Windows here; it can spawn reloader processes that keep ports open and lead to 'buffering' / hung servers.
-    & ..\venv\Scripts\python.exe -m uvicorn api.main:app --host 127.0.0.1 --port $BackendPort
+    $PythonExe = Resolve-Path (Join-Path $VenvRoot "Scripts\python.exe")
+    & $PythonExe -m uvicorn api.main:app --host 127.0.0.1 --port $BackendPort
 } finally {
     Pop-Location
 }

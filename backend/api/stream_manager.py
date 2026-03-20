@@ -41,6 +41,9 @@ def _pick_history_fourcc_candidates() -> list[str]:
         return parts or [override]
 
     # Default preference order
+    if os.name == "nt":
+        return ["mp4v", "avc1", "H264", "X264"]
+
     return ["avc1", "H264", "X264", "mp4v"]
 
 
@@ -563,7 +566,7 @@ class StreamWorker:
 
         # Prefer browser-friendly H.264 MP4 when available.
         # Fallback to mp4v if the environment lacks H.264 support.
-        force_mp4v = _bool_env("INTENTWATCH_HISTORY_FORCE_MP4V", False)
+        force_mp4v = _bool_env("INTENTWATCH_HISTORY_FORCE_MP4V", os.name == "nt")
         candidates = ["mp4v"] if force_mp4v else _pick_history_fourcc_candidates()
 
         writer = None

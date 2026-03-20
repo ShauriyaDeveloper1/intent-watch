@@ -29,7 +29,6 @@ type SettingsState = {
   // Alert Settings
   sound: boolean;
   alertLogging: boolean;
-  email: boolean;
 };
 
 export function Settings() {
@@ -52,7 +51,6 @@ export function Settings() {
 
       sound: true,
       alertLogging: true,
-      email: false,
     }),
     [],
   );
@@ -89,7 +87,6 @@ export function Settings() {
 
         if (typeof parsed.sound === 'boolean') next.sound = parsed.sound;
         if (typeof parsed.alertLogging === 'boolean') next.alertLogging = parsed.alertLogging;
-        if (typeof parsed.email === 'boolean') next.email = parsed.email;
 
         return next;
       });
@@ -266,10 +263,6 @@ export function Settings() {
             <div className="flex items-center justify-between">
               <span className="text-sm text-foreground">Alert logging toggle</span>
               <Switch checked={settings.alertLogging} onCheckedChange={(v) => update('alertLogging', Boolean(v))} />
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-sm text-foreground">Email toggle</span>
-              <Switch checked={settings.email} onCheckedChange={(v) => update('email', Boolean(v))} />
             </div>
           </div>
         </Card>
