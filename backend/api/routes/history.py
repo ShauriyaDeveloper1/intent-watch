@@ -6,6 +6,8 @@ from pathlib import Path
 import os
 import re
 import json
+import time
+import threading
 
 router = APIRouter()
 
@@ -46,6 +48,134 @@ def _safe_filename(name: str) -> str:
     return n
 
 
+def _safe_clip_path(stream_id: str, date: str, filename: str) -> Path:
+    sid = _safe_stream_id(stream_id)
+    d = _safe_date(date)
+    fn = _safe_filename(filename)
+
+    p = (HISTORY_DIR / sid / d / fn).resolve()
+    if HISTORY_DIR.resolve() not in p.parents:
+        raise HTTPException(status_code=400, detail="Invalid path")
+    return p
+
+
+def cleanup_old_history_files(*, retention_days: int) -> dict:
+    try:
+        days = int(retention_days)
+    except Exception:
+        days = 180
+    if days <= 0:
+        return {"retention_days": days, "deleted": 0, "errors": 0}
+
+    cutoff = time.time() - (float(days) * 86400.0)
+
+    deleted = 0
+    errors = 0
+
+    if not HISTORY_DIR.exists():
+        return {"retention_days": days, "deleted": 0, "errors": 0}
+
+    mp4_files = list(HISTORY_DIR.rglob("*.mp4"))
+    for p in mp4_files:
+        try:
+            rp = p.resolve()
+            if HISTORY_DIR.resolve() not in rp.parents:
+                continue
+            if not rp.is_file():
+                continue
+            try:
+                mtime = float(rp.stat().st_mtime)
+            except Exception:
+                continue
+            if mtime >= cutoff:
+                continue
+
+            meta = rp.with_suffix(rp.suffix + ".json")
+            try:
+                rp.unlink(missing_ok=True)
+                deleted += 1
+            except Exception:
+                errors += 1
+
+            try:
+                meta.unlink(missing_ok=True)
+            except Exception:
+                pass
+        except Exception:
+            errors += 1
+
+    # Clean up orphaned sidecars
+    json_files = list(HISTORY_DIR.rglob("*.mp4.json"))
+    for jp in json_files:
+        try:
+            rp = jp.resolve()
+            if HISTORY_DIR.resolve() not in rp.parents:
+                continue
+            base = Path(str(rp)[: -len(".json")])
+            if base.exists():
+                continue
+            rp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # Remove empty day/stream folders
+    try:
+        for day_dir in sorted([p for p in HISTORY_DIR.rglob("*") if p.is_dir()], reverse=True):
+            try:
+                if any(day_dir.iterdir()):
+                    continue
+                day_dir.rmdir()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return {"retention_days": days, "deleted": deleted, "errors": errors}
+
+
+def start_history_retention_worker() -> None:
+    enabled = _env_bool("INTENTWATCH_HISTORY_RETENTION_ENABLED", True)
+    if not enabled:
+        return
+
+    try:
+        retention_days = int(os.getenv("INTENTWATCH_HISTORY_RETENTION_DAYS") or "180")
+    except Exception:
+        retention_days = 180
+
+    try:
+        interval_hours = int(os.getenv("INTENTWATCH_HISTORY_CLEANUP_INTERVAL_HOURS") or "24")
+    except Exception:
+        interval_hours = 24
+
+    if interval_hours <= 0:
+        interval_hours = 24
+
+    def _loop() -> None:
+        while True:
+            try:
+                res = cleanup_old_history_files(retention_days=retention_days)
+                if int(res.get("deleted") or 0) > 0:
+                    print(
+                        f"✓ History retention cleanup deleted {res['deleted']} clip(s) "
+                        f"(retention_days={res['retention_days']}, errors={res['errors']})"
+                    )
+            except Exception as e:
+                try:
+                    print(f"✗ History retention cleanup failed: {e}")
+                except Exception:
+                    pass
+            time.sleep(float(interval_hours) * 3600.0)
+
+    # Run once immediately, then on the interval.
+    try:
+        cleanup_old_history_files(retention_days=retention_days)
+    except Exception:
+        pass
+
+    threading.Thread(target=_loop, name="history-retention", daemon=True).start()
+
+
 @router.get("/dates")
 def list_dates(stream_id: str = "primary"):
     sid = _safe_stream_id(stream_id)
@@ -59,6 +189,34 @@ def list_dates(stream_id: str = "primary"):
             dates.append(p.name)
     dates.sort(reverse=True)
     return {"stream_id": sid, "dates": dates}
+
+
+@router.get("/streams")
+def list_streams():
+    """List stream_ids that have local history clips."""
+    if not HISTORY_DIR.exists():
+        return {"streams": []}
+
+    streams: list[str] = []
+    try:
+        for p in HISTORY_DIR.iterdir():
+            if not p.is_dir():
+                continue
+            # Reuse the same safety checks as inputs
+            try:
+                sid = _safe_stream_id(p.name)
+            except HTTPException:
+                continue
+            streams.append(sid)
+    except Exception:
+        streams = []
+
+    streams.sort()
+    # Prefer primary first when present
+    if "primary" in streams:
+        streams = ["primary"] + [s for s in streams if s != "primary"]
+
+    return {"streams": streams}
 
 
 @router.get("/supabase/status")
@@ -138,14 +296,7 @@ def list_clips(stream_id: str = "primary", date: str | None = None):
 
 @router.get("/clip/{stream_id}/{date}/{filename}")
 def get_clip(stream_id: str, date: str, filename: str, request: Request):
-    sid = _safe_stream_id(stream_id)
-    d = _safe_date(date)
-    fn = _safe_filename(filename)
-
-    p = (HISTORY_DIR / sid / d / fn).resolve()
-    # Ensure resolved path is still under HISTORY_DIR
-    if HISTORY_DIR.resolve() not in p.parents:
-        raise HTTPException(status_code=400, detail="Invalid path")
+    p = _safe_clip_path(stream_id, date, filename)
 
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail="Clip not found")
@@ -195,6 +346,40 @@ def get_clip(stream_id: str, date: str, filename: str, request: Request):
     return FileResponse(
         str(p),
         media_type="video/mp4",
-        filename=fn,
+        filename=os.path.basename(str(p)),
         headers={"Accept-Ranges": "bytes"},
     )
+
+
+@router.delete("/clip/{stream_id}/{date}/{filename}")
+def delete_clip(stream_id: str, date: str, filename: str):
+    p = _safe_clip_path(stream_id, date, filename)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    deleted_files: list[str] = []
+    try:
+        p.unlink(missing_ok=True)
+        deleted_files.append(p.name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete clip: {e}")
+
+    meta = p.with_suffix(p.suffix + ".json")
+    try:
+        if meta.exists() and meta.is_file():
+            meta.unlink(missing_ok=True)
+            deleted_files.append(meta.name)
+    except Exception:
+        pass
+
+    try:
+        day_dir = p.parent
+        if day_dir.exists() and day_dir.is_dir() and not any(day_dir.iterdir()):
+            day_dir.rmdir()
+        stream_dir = day_dir.parent
+        if stream_dir.exists() and stream_dir.is_dir() and not any(stream_dir.iterdir()):
+            stream_dir.rmdir()
+    except Exception:
+        pass
+
+    return {"message": "Clip deleted", "deleted": deleted_files}

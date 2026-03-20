@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
@@ -14,7 +15,8 @@ type Clip = {
 };
 
 export function History() {
-  const [streamId] = useState('primary');
+  const [streamId, setStreamId] = useState('primary');
+  const [streamIds, setStreamIds] = useState<string[]>(['primary']);
   const [dates, setDates] = useState<string[]>([]);
   const [selectedDate, setSelectedDate] = useState<string>('');
   const [clips, setClips] = useState<Clip[]>([]);
@@ -24,6 +26,37 @@ export function History() {
   const [refreshToken, setRefreshToken] = useState(0);
   const [useSupabase, setUseSupabase] = useState(false);
   const [playbackError, setPlaybackError] = useState<string>('');
+  const [deleting, setDeleting] = useState<string | null>(null);
+
+  const CAMERA_STORAGE_KEY = 'intentwatch.cameras.v1';
+  const getSavedCameraIds = () => {
+    try {
+      const raw = window.localStorage.getItem(CAMERA_STORAGE_KEY);
+      if (!raw) return [] as string[];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [] as string[];
+      const ids = parsed
+        .map((x: any) => String(x?.id ?? '').trim())
+        .filter((x: string) => x && x !== 'primary');
+      return Array.from(new Set(ids));
+    } catch {
+      return [] as string[];
+    }
+  };
+  const getSavedCameraName = (id: string) => {
+    try {
+      const raw = window.localStorage.getItem(CAMERA_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return null;
+      const item = parsed.find((x: any) => x && String(x.id) === String(id));
+      if (!item) return null;
+      const name = String(item.name ?? '').trim();
+      return name || null;
+    } catch {
+      return null;
+    }
+  };
 
   const clipSrc = useMemo(() => {
     if (!selectedClip) return '';
@@ -36,6 +69,40 @@ export function History() {
 
   useEffect(() => {
     let mounted = true;
+    const loadStreams = async () => {
+      setError('');
+      try {
+        const res = await fetch(`${API_BASE_URL}/history/streams`, { cache: 'no-store' });
+        if (!res.ok) throw new Error('Failed to load history streams');
+        const data = await res.json();
+        const next = Array.isArray(data?.streams) ? (data.streams as string[]) : [];
+        if (!mounted) return;
+        const saved = getSavedCameraIds();
+        const merged = ['primary', ...next.filter((s) => s && s !== 'primary'), ...saved];
+        // de-dupe while preserving order
+        const uniq: string[] = [];
+        for (const s of merged) {
+          if (!s) continue;
+          if (uniq.includes(s)) continue;
+          uniq.push(s);
+        }
+        setStreamIds(uniq.length ? uniq : ['primary']);
+        setStreamId((prev) => (uniq.includes(prev) ? prev : uniq[0] || 'primary'));
+      } catch {
+        // If the backend is older or endpoint missing, fall back to primary.
+        if (!mounted) return;
+        setStreamIds(['primary']);
+        setStreamId('primary');
+      }
+    };
+    void loadStreams();
+    return () => {
+      mounted = false;
+    };
+  }, [refreshToken]);
+
+  useEffect(() => {
+    let mounted = true;
     const loadDates = async () => {
       setError('');
       try {
@@ -45,7 +112,10 @@ export function History() {
         const next = Array.isArray(data?.dates) ? (data.dates as string[]) : [];
         if (!mounted) return;
         setDates(next);
-        setSelectedDate((prev) => prev || next[0] || '');
+        setSelectedDate((prev) => {
+          if (prev && next.includes(prev)) return prev;
+          return next[0] || '';
+        });
       } catch (e: any) {
         if (!mounted) return;
         setError(String(e?.message || e || 'Failed to load history dates'));
@@ -94,6 +164,43 @@ export function History() {
     };
   }, [selectedDate, streamId, refreshToken]);
 
+  const deleteClip = async (c: Clip) => {
+    if (!c || !selectedDate || !streamId) return;
+    setError('');
+    setDeleting(c.filename);
+    try {
+      const url = `${API_BASE_URL}/history/clip/${encodeURIComponent(streamId)}/${encodeURIComponent(selectedDate)}/${encodeURIComponent(c.filename)}`;
+      const res = await fetch(url, { method: 'DELETE' });
+      if (!res.ok) {
+        let detail = 'Failed to delete clip';
+        try {
+          const data = await res.json();
+          detail = String((data as any)?.detail ?? detail);
+        } catch {
+          // ignore
+        }
+        throw new Error(detail);
+      }
+
+      setClips((prev) => {
+        const next = prev.filter((x) => x.filename !== c.filename);
+        setSelectedClip((prevSelected) => {
+          if (!prevSelected) return next[0] || null;
+          if (prevSelected.filename !== c.filename) return prevSelected;
+          return next[0] || null;
+        });
+        return next;
+      });
+      setPlaybackError('');
+      setUseSupabase(false);
+      setRefreshToken((n) => n + 1);
+    } catch (e: any) {
+      setError(String(e?.message || e || 'Failed to delete clip'));
+    } finally {
+      setDeleting(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <Card>
@@ -103,12 +210,26 @@ export function History() {
         <CardContent className="space-y-4">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2">
+              <div className="text-sm text-muted-foreground">Camera</div>
+              <Select value={streamId} onValueChange={setStreamId}>
+                <SelectTrigger className="w-[220px]">
+                  <SelectValue placeholder="Select camera" />
+                </SelectTrigger>
+                <SelectContent>
+                  {streamIds.map((id) => (
+                    <SelectItem key={id} value={id}>
+                      {getSavedCameraName(id) ? `${getSavedCameraName(id)} (${id})` : id}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               <div className="text-sm text-muted-foreground">Date</div>
               <Input
                 type="date"
                 value={selectedDate}
                 onChange={(e) => setSelectedDate(e.target.value)}
-                className="w-[180px]"
+                className="w-[190px] [color-scheme:dark]"
+                style={{ colorScheme: 'dark' } as any}
               />
               {dates.length > 0 && (
                 <div className="text-xs text-muted-foreground">({dates.length} days)</div>
@@ -143,21 +264,32 @@ export function History() {
                   const sizeMb = (c.size_bytes / (1024 * 1024)).toFixed(1);
                   const time = new Date(c.mtime * 1000).toLocaleTimeString();
                   return (
-                    <button
-                      key={c.filename}
-                      className={`w-full text-left rounded-md border px-3 py-2 transition-colors ${
-                        active
-                          ? 'bg-accent text-foreground border-border'
-                          : 'bg-background hover:bg-accent/50 text-foreground border-border'
-                      }`}
-                      onClick={() => setSelectedClip(c)}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="font-medium text-sm truncate">{c.filename}</div>
-                        <div className="text-xs text-muted-foreground shrink-0">{sizeMb} MB</div>
-                      </div>
-                      <div className="text-xs text-muted-foreground">{time}</div>
-                    </button>
+                    <div key={c.filename} className="flex items-stretch gap-2">
+                      <button
+                        className={`flex-1 text-left rounded-md border px-3 py-2 transition-colors ${
+                          active
+                            ? 'bg-accent text-foreground border-border'
+                            : 'bg-background hover:bg-accent/50 text-foreground border-border'
+                        }`}
+                        onClick={() => setSelectedClip(c)}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="font-medium text-sm truncate">{c.filename}</div>
+                          <div className="text-xs text-muted-foreground shrink-0">{sizeMb} MB</div>
+                        </div>
+                        <div className="text-xs text-muted-foreground">{time}</div>
+                      </button>
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        disabled={Boolean(deleting)}
+                        onClick={() => void deleteClip(c)}
+                        title="Delete clip"
+                        className="shrink-0"
+                      >
+                        {deleting === c.filename ? 'Deleting…' : 'Delete'}
+                      </Button>
+                    </div>
                   );
                 })}
               </div>

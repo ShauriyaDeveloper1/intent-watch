@@ -47,6 +47,14 @@ app.include_router(alerts.router, prefix="/alerts", tags=["Alerts"])
 app.include_router(history.router, prefix="/history", tags=["History"])
 app.include_router(metrics.router, tags=["Metrics"])
 
+
+@app.on_event("startup")
+def _startup_tasks():
+    try:
+        history.start_history_retention_worker()
+    except Exception:
+        pass
+
 @app.get("/")
 def root():
     return {"status": "IntentWatch backend running"}
