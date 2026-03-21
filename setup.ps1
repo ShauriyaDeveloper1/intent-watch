@@ -73,7 +73,7 @@ try {
 # Step 5: Install frontend dependencies
 Write-Host ""
 Write-Host "[5/5] Installing frontend dependencies..." -ForegroundColor Yellow
-Push-Location "Build AI Surveillance System"
+Push-Location "Frontend"
 try {
     if (Test-Path ".\node_modules") {
         Write-Host "  [OK] Frontend dependencies already installed" -ForegroundColor Green

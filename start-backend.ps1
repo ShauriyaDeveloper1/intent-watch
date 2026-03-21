@@ -34,7 +34,8 @@ if (-Not (Test-Path ".\backend\api\main.py")) {
 
 # Start the FastAPI server
 $BackendPort = if ($env:INTENTWATCH_BACKEND_PORT) { [int]$env:INTENTWATCH_BACKEND_PORT } else { 8000 }
-Write-Host "Starting FastAPI server on http://localhost:$BackendPort..." -ForegroundColor Green
+$BackendHost = if ($env:INTENTWATCH_BACKEND_HOST) { $env:INTENTWATCH_BACKEND_HOST } else { "127.0.0.1" }
+Write-Host "Starting FastAPI server on http://$BackendHost`:$BackendPort..." -ForegroundColor Green
 Write-Host ""
 
 # Optional: auto-wire trained weapon model if present.
@@ -109,7 +110,7 @@ Push-Location backend
 try {
     # Avoid --reload on Windows here; it can spawn reloader processes that keep ports open and lead to 'buffering' / hung servers.
     $PythonExe = Resolve-Path (Join-Path $VenvRoot "Scripts\python.exe")
-    & $PythonExe -m uvicorn api.main:app --host 127.0.0.1 --port $BackendPort
+    & $PythonExe -m uvicorn api.main:app --host $BackendHost --port $BackendPort
 } finally {
     Pop-Location
 }

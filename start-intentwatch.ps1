@@ -14,7 +14,7 @@ if (-Not (Test-Path ".\backend")) {
     exit 1
 }
 
-if (-Not (Test-Path ".\Build AI Surveillance System")) {
+if (-Not (Test-Path ".\Frontend")) {
     Write-Host "Error: Frontend directory not found!" -ForegroundColor Red
     exit 1
 }

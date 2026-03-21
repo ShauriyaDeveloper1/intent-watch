@@ -5,7 +5,7 @@ Write-Host "Starting IntentWatch Frontend..." -ForegroundColor Cyan
 Write-Host ""
 
 # Navigate to frontend directory
-Set-Location "Build AI Surveillance System"
+Set-Location "Frontend"
 
 # Check if node_modules exists
 if (-Not (Test-Path ".\node_modules")) {
