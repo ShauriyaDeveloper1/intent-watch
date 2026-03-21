@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import os
 
 # Load environment variables from local .env files (if present) BEFORE importing routes.
 # This ensures modules that read env vars at import/initialization time pick them up.
@@ -20,6 +21,14 @@ except Exception:
 
 from api.routes import video, alerts, metrics, history
 
+
+def _parse_csv_env(name: str) -> list[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return []
+    parts = [p.strip() for p in str(raw).split(",")]
+    return [p for p in parts if p]
+
 # ✅ FIRST create the app
 app = FastAPI(
     title="IntentWatch Backend",
@@ -28,14 +37,22 @@ app = FastAPI(
 )
 
 # ✅ THEN add middleware
+default_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+extra_origins = _parse_csv_env("INTENTWATCH_CORS_ORIGINS")
+allow_origins = default_origins + [o for o in extra_origins if o not in default_origins]
+
+allow_origin_regex = (os.getenv("INTENTWATCH_CORS_ORIGIN_REGEX") or "").strip() or None
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

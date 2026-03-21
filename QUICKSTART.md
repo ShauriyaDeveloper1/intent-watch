@@ -74,7 +74,7 @@ This will open two terminal windows:
 pip install -r requirements.txt
 
 # Frontend
-cd "Build AI Surveillance System"
+cd "Frontend"
 npm install
 ```
 
@@ -105,7 +105,7 @@ uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
 ```powershell
 # Navigate to frontend
-cd "Build AI Surveillance System"
+cd "Frontend"
 
 # Install dependencies
 npm install
@@ -188,7 +188,7 @@ Stop-Process -Id (Get-NetTCPConnection -LocalPort 8000).OwningProcess -Force
 **Problem:** "Dependencies not installed"
 ```powershell
 # Solution:
-cd "Build AI Surveillance System"
+cd "Frontend"
 npm install
 ```
 
@@ -215,7 +215,7 @@ Stop-Process -Id (Get-NetTCPConnection -LocalPort 5173).OwningProcess -Force
 
 **Problem:** "Failed to fetch" errors
 - ✅ Ensure backend is running on port 8000
-- ✅ Check `Build AI Surveillance System/.env` file
+- ✅ Check `Frontend/.env` file
 - ✅ Clear browser cache
 - ✅ Check CORS settings in `backend/api/main.py`
 
@@ -236,8 +236,8 @@ RUNNING_SPEED_THRESHOLD = 120  # pixels/second for running
 ### Change UI Theme
 
 Edit Tailwind classes in React components:
-- Components are in `Build AI Surveillance System/src/app/components/`
-- Pages are in `Build AI Surveillance System/src/app/pages/`
+- Components are in `Frontend/src/app/components/`
+- Pages are in `Frontend/src/app/pages/`
 
 ### Add Custom Alerts
 
@@ -295,7 +295,7 @@ IntentWatch/
 │   ├── api/main.py              # API entry point
 │   └── api/routes/              # API endpoints
 │
-└── 🎨 Build AI Surveillance System/  # React frontend
+└── 🎨 Frontend/  # React frontend
     ├── src/app/pages/           # UI pages
     ├── src/services/api.ts      # Backend integration
     └── vite.config.ts           # Dev server config

@@ -57,7 +57,7 @@ pip install -r requirements.txt
 ### 4. Install Frontend Dependencies
 
 ```powershell
-cd "Build AI Surveillance System"
+cd "Frontend"
 npm install
 cd ..
 ```
@@ -99,7 +99,7 @@ uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
 #### Frontend:
 ```powershell
-cd "Build AI Surveillance System"
+cd "Frontend"
 npm run dev
 ```
 
@@ -136,7 +136,7 @@ IntentWatch/
 │   ├── data/videos/           # Uploaded videos storage
 │   └── requirements.txt       # Python dependencies
 │
-├── Build AI Surveillance System/  # React frontend
+├── Frontend/  # React frontend
 │   ├── src/
 │   │   ├── app/
 │   │   │   ├── App.tsx        # Main app component
@@ -198,7 +198,7 @@ pip install -r requirements.txt
 
 **Error: "Cannot find module"**
 ```powershell
-cd "Build AI Surveillance System"
+cd "Frontend"
 npm install
 ```
 
@@ -224,8 +224,8 @@ npm install
 
 ### Customizing the UI
 
-- Frontend pages are in `Build AI Surveillance System/src/app/pages/`
-- Components are in `Build AI Surveillance System/src/app/components/`
+- Frontend pages are in `Frontend/src/app/pages/`
+- Components are in `Frontend/src/app/components/`
 - Styles use Tailwind CSS classes
 
 ## Performance Tips

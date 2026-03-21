@@ -9,7 +9,7 @@ Your backend and frontend are now fully integrated and ready to run as a complet
 ## 🔗 What Was Integrated
 
 ### 1. **API Service Layer**
-**File:** `Build AI Surveillance System/src/services/api.ts`
+**File:** `Frontend/src/services/api.ts`
 
 - ✅ Created complete API client for backend communication
 - ✅ Video upload and streaming endpoints
@@ -18,7 +18,7 @@ Your backend and frontend are now fully integrated and ready to run as a complet
 - ✅ Environment variable support
 
 ### 2. **Live Feed Page**
-**File:** `Build AI Surveillance System/src/app/pages/LiveFeed.tsx`
+**File:** `Frontend/src/app/pages/LiveFeed.tsx`
 
 **Changes:**
 - ✅ Connected to real backend video stream
@@ -35,7 +35,7 @@ Your backend and frontend are now fully integrated and ready to run as a complet
 - System status indicators
 
 ### 3. **Alerts Log Page**
-**File:** `Build AI Surveillance System/src/app/pages/AlertsLog.tsx`
+**File:** `Frontend/src/app/pages/AlertsLog.tsx`
 
 **Changes:**
 - ✅ Fetches real alerts from backend
@@ -60,7 +60,7 @@ Your backend and frontend are now fully integrated and ready to run as a complet
 - ✅ Allows all HTTP methods and headers
 
 ### 5. **Vite Configuration**
-**File:** `Build AI Surveillance System/vite.config.ts`
+**File:** `Frontend/vite.config.ts`
 
 **Changes:**
 - ✅ Added API proxy configuration
@@ -69,8 +69,8 @@ Your backend and frontend are now fully integrated and ready to run as a complet
 
 ### 6. **Environment Configuration**
 **Files:** 
-- `Build AI Surveillance System/.env`
-- `Build AI Surveillance System/.env.example`
+- `Frontend/.env`
+- `Frontend/.env.example`
 
 **Changes:**
 - ✅ Created environment files
