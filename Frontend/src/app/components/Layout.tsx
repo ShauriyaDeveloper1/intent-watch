@@ -11,7 +11,6 @@ import {
   MapPin,
   Settings as SettingsIcon,
   Activity,
-  Shield
 } from 'lucide-react';
 
 type ThemeColor = 'purple' | 'blue' | 'green' | 'red' | 'orange' | 'vibrant';
@@ -135,8 +134,12 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <div className="px-6 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className={`${brand.bg} p-2 rounded-lg`}>
-                <Shield className="w-6 h-6 text-white" />
+              <div className="p-1.5 rounded-lg">
+                <img
+                  src="/intentwatch-logo.png"
+                  alt="IntentWatch"
+                  className="w-11 h-11 object-contain"
+                />
               </div>
               <div>
                 <h1 className="text-xl font-bold">IntentWatch</h1>

@@ -8,6 +8,7 @@ import re
 import json
 import time
 import threading
+import tempfile
 
 router = APIRouter()
 
@@ -75,8 +76,10 @@ def cleanup_old_history_files(*, retention_days: int) -> dict:
     if not HISTORY_DIR.exists():
         return {"retention_days": days, "deleted": 0, "errors": 0}
 
-    mp4_files = list(HISTORY_DIR.rglob("*.mp4"))
-    for p in mp4_files:
+    media_files: list[Path] = []
+    media_files.extend(list(HISTORY_DIR.rglob("*.mp4")))
+    media_files.extend(list(HISTORY_DIR.rglob("*.webm")))
+    for p in media_files:
         try:
             rp = p.resolve()
             if HISTORY_DIR.resolve() not in rp.parents:
@@ -105,7 +108,9 @@ def cleanup_old_history_files(*, retention_days: int) -> dict:
             errors += 1
 
     # Clean up orphaned sidecars
-    json_files = list(HISTORY_DIR.rglob("*.mp4.json"))
+    json_files: list[Path] = []
+    json_files.extend(list(HISTORY_DIR.rglob("*.mp4.json")))
+    json_files.extend(list(HISTORY_DIR.rglob("*.webm.json")))
     for jp in json_files:
         try:
             rp = jp.resolve()
@@ -263,7 +268,10 @@ def list_clips(stream_id: str = "primary", date: str | None = None):
         return {"stream_id": sid, "date": d, "clips": []}
 
     clips = []
-    for p in sorted(day_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True):
+    media_paths: list[Path] = []
+    media_paths.extend(list(day_dir.glob("*.mp4")))
+    media_paths.extend(list(day_dir.glob("*.webm")))
+    for p in sorted(media_paths, key=lambda x: x.stat().st_mtime, reverse=True):
         try:
             size_bytes = int(p.stat().st_size)
         except Exception:
@@ -281,6 +289,15 @@ def list_clips(stream_id: str = "primary", date: str | None = None):
             except Exception:
                 meta = None
 
+        mime = "video/webm" if p.suffix.lower() == ".webm" else "video/mp4"
+
+        alt_url = None
+        alt_mime = None
+        if p.suffix.lower() == ".mp4":
+            # Allow frontend to fall back to WebM conversion if MP4 playback fails in browser.
+            alt_url = f"/history/clip/{sid}/{d}/{p.name}?format=webm"
+            alt_mime = "video/webm"
+
         clips.append(
             {
                 "filename": p.name,
@@ -288,18 +305,102 @@ def list_clips(stream_id: str = "primary", date: str | None = None):
                 "mtime": int(p.stat().st_mtime),
                 "public_url": (meta or {}).get("public_url"),
                 "url": f"/history/clip/{sid}/{d}/{p.name}",
+                "mime": mime,
+                "alt_url": alt_url,
+                "alt_mime": alt_mime,
             }
         )
 
     return {"stream_id": sid, "date": d, "clips": clips}
 
 
+def _media_type_for_path(p: Path) -> str:
+    return "video/webm" if p.suffix.lower() == ".webm" else "video/mp4"
+
+
+def _transcode_mp4_to_webm(src: Path, dst: Path) -> None:
+    # Best-effort conversion using OpenCV/FFmpeg bindings.
+    # Writes to a temp file then renames atomically.
+    import cv2
+
+    cap = cv2.VideoCapture(str(src))
+    if not cap.isOpened():
+        raise RuntimeError("Failed to open source clip for transcoding")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if not (1.0 < fps < 121.0):
+        fps = 15.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if w <= 0 or h <= 0:
+        # Fallback: grab one frame to infer size
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            cap.release()
+            raise RuntimeError("Failed to read frames for transcoding")
+        h, w = frame.shape[:2]
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    # Create temp file on the same drive as destination (Windows can't os.replace across drives).
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd = None
+    tmp_path = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=f"iw-transcode-{dst.stem}-", suffix=".webm", dir=str(dst.parent))
+        os.close(tmp_fd)
+        tmp = Path(tmp_path)
+    except Exception:
+        # Fallback: best-effort unique name in destination folder.
+        tmp = dst.parent / f"iw-transcode-{dst.stem}-{int(time.time())}.webm"
+    try:
+        cc = cv2.VideoWriter_fourcc(*"VP80")
+        writer = cv2.VideoWriter(str(tmp), cc, fps, (w, h))
+        if not writer.isOpened():
+            writer.release()
+            cap.release()
+            raise RuntimeError("Failed to initialize WebM writer")
+
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            writer.write(frame)
+
+        writer.release()
+        cap.release()
+
+        if not tmp.exists() or tmp.stat().st_size < 1024:
+            raise RuntimeError("Transcode produced an empty WebM")
+
+        os.replace(str(tmp), str(dst))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 @router.get("/clip/{stream_id}/{date}/{filename}")
-def get_clip(stream_id: str, date: str, filename: str, request: Request):
+def get_clip(stream_id: str, date: str, filename: str, request: Request, format: str | None = None):
     p = _safe_clip_path(stream_id, date, filename)
 
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail="Clip not found")
+
+    # Optional on-demand conversion for browser playback.
+    # If the frontend requests ?format=webm for an MP4, convert once and cache alongside the original.
+    if format and str(format).strip().lower() == "webm":
+        if p.suffix.lower() == ".webm":
+            pass
+        elif p.suffix.lower() == ".mp4":
+            webm_path = p.with_suffix(".webm")
+            try:
+                if (not webm_path.exists()) or (webm_path.stat().st_mtime < p.stat().st_mtime):
+                    _transcode_mp4_to_webm(p, webm_path)
+                p = webm_path
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to transcode clip: {e}")
 
     file_size = int(p.stat().st_size)
     range_header = request.headers.get("range") or request.headers.get("Range")
@@ -340,12 +441,12 @@ def get_clip(stream_id: str, date: str, filename: str, request: Request):
             "Accept-Ranges": "bytes",
             "Content-Length": str(length),
         }
-        return StreamingResponse(_iterfile(), status_code=206, media_type="video/mp4", headers=headers)
+        return StreamingResponse(_iterfile(), status_code=206, media_type=_media_type_for_path(p), headers=headers)
 
     # No range: serve full file. Still advertise Accept-Ranges.
     return FileResponse(
         str(p),
-        media_type="video/mp4",
+        media_type=_media_type_for_path(p),
         filename=os.path.basename(str(p)),
         headers={"Accept-Ranges": "bytes"},
     )
@@ -363,6 +464,20 @@ def delete_clip(stream_id: str, date: str, filename: str):
         deleted_files.append(p.name)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete clip: {e}")
+
+    # If deleting an MP4, also delete a cached WebM transcode (same stem).
+    try:
+        if p.suffix.lower() == ".mp4":
+            w = p.with_suffix(".webm")
+            if w.exists() and w.is_file():
+                w.unlink(missing_ok=True)
+                deleted_files.append(w.name)
+            wmeta = w.with_suffix(w.suffix + ".json")
+            if wmeta.exists() and wmeta.is_file():
+                wmeta.unlink(missing_ok=True)
+                deleted_files.append(wmeta.name)
+    except Exception:
+        pass
 
     meta = p.with_suffix(p.suffix + ".json")
     try:
