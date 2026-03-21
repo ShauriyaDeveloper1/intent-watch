@@ -12,6 +12,9 @@ type Clip = {
   mtime: number;
   public_url?: string | null;
   url: string; // backend relative url
+  mime?: string;
+  alt_url?: string | null;
+  alt_mime?: string | null;
 };
 
 export function History() {
@@ -25,6 +28,7 @@ export function History() {
   const [error, setError] = useState<string>('');
   const [refreshToken, setRefreshToken] = useState(0);
   const [useSupabase, setUseSupabase] = useState(false);
+  const [useAlt, setUseAlt] = useState(false);
   const [playbackError, setPlaybackError] = useState<string>('');
   const [deleting, setDeleting] = useState<string | null>(null);
 
@@ -62,10 +66,22 @@ export function History() {
     if (!selectedClip) return '';
     // Prefer streaming via backend for reliable playback (correct MIME + CORS).
     // If playback fails and we have a Supabase URL, we can fall back.
-    if (!useSupabase && selectedClip.url) return `${API_BASE_URL}${selectedClip.url}`;
+    if (!useSupabase) {
+      const rel = useAlt && selectedClip.alt_url ? selectedClip.alt_url : selectedClip.url;
+      if (rel) return `${API_BASE_URL}${rel}`;
+    }
     if (selectedClip.public_url) return selectedClip.public_url;
     return '';
-  }, [selectedClip, useSupabase]);
+  }, [selectedClip, useSupabase, useAlt]);
+
+  const clipMime = useMemo(() => {
+    if (!selectedClip) return 'video/mp4';
+    if (!useSupabase && useAlt && selectedClip.alt_mime) return selectedClip.alt_mime;
+    if (selectedClip.mime) return selectedClip.mime;
+    const name = (selectedClip.filename || '').toLowerCase();
+    if (name.endsWith('.webm')) return 'video/webm';
+    return 'video/mp4';
+  }, [selectedClip, useSupabase, useAlt]);
 
   useEffect(() => {
     let mounted = true;
@@ -147,6 +163,7 @@ export function History() {
         setClips(next);
         setSelectedClip(next[0] || null);
         setUseSupabase(false);
+        setUseAlt(false);
         setPlaybackError('');
       } catch (e: any) {
         if (!mounted) return;
@@ -193,6 +210,7 @@ export function History() {
       });
       setPlaybackError('');
       setUseSupabase(false);
+      setUseAlt(false);
       setRefreshToken((n) => n + 1);
     } catch (e: any) {
       setError(String(e?.message || e || 'Failed to delete clip'));
@@ -305,19 +323,26 @@ export function History() {
                     preload="metadata"
                     className="w-full rounded-md bg-black"
                     onError={() => {
-                      // If backend playback fails (codec/range), try Supabase URL when available.
+                      // If backend MP4 playback fails, try backend WebM conversion when available.
+                      if (!useSupabase && !useAlt && selectedClip.alt_url) {
+                        setUseAlt(true);
+                        setPlaybackError('');
+                        return;
+                      }
+                      // If backend playback fails, try Supabase URL when available.
                       if (!useSupabase && selectedClip.public_url) {
                         setUseSupabase(true);
                         setPlaybackError('');
                         return;
                       }
-                      setPlaybackError('This clip could not be played in your browser. Try recording a new clip after restarting the backend.');
+                      setPlaybackError('This clip could not be played in your browser.');
                     }}
                   >
-                    <source src={clipSrc} type="video/mp4" />
+                    <source src={clipSrc} type={clipMime} />
                   </video>
                   <div className="mt-2 text-xs text-muted-foreground">
-                    Source: {useSupabase ? 'Supabase' : 'Local backend'}{selectedClip.public_url ? ' (uploaded)' : ''}
+                    Source: {useSupabase ? 'Supabase' : useAlt ? 'Local backend (WebM)' : 'Local backend'}
+                    {selectedClip.public_url ? ' (uploaded)' : ''}
                   </div>
                   {playbackError && (
                     <div className="mt-2 text-xs text-red-400">{playbackError}</div>

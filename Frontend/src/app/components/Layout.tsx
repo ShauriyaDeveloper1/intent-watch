@@ -134,11 +134,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <div className="px-6 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className={`${brand.bg} p-2 rounded-lg`}>
+              <div className="p-1.5 rounded-lg">
                 <img
                   src="/intentwatch-logo.png"
                   alt="IntentWatch"
-                  className="w-6 h-6 object-contain"
+                  className="w-11 h-11 object-contain"
                 />
               </div>
               <div>

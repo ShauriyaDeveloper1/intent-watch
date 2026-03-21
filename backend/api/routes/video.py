@@ -464,6 +464,12 @@ def list_streams():
     return {"streams": [{"id": sid, **manager.get_status(sid)} for sid in ids]}
 
 
+@router.get("/debug/models")
+def debug_models():
+    """Diagnostics: show which model checkpoints are selected/loaded."""
+    return manager.model_diagnostics()
+
+
 @router.post("/streams/start")
 def start_stream(body: StartStreamRequest):
     if body is None or not body.stream_id or not body.source:

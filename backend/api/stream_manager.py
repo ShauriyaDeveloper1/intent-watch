@@ -41,10 +41,12 @@ def _pick_history_fourcc_candidates() -> list[str]:
         return parts or [override]
 
     # Default preference order
+    # On Windows, H.264 encoding often depends on an external OpenH264 DLL.
+    # VP8/WebM is typically a safer fallback for browser playback.
     if os.name == "nt":
-        return ["mp4v", "avc1", "H264", "X264"]
+        return ["VP80", "avc1", "H264", "X264", "mp4v"]
 
-    return ["avc1", "H264", "X264", "mp4v"]
+    return ["avc1", "H264", "X264", "mp4v", "VP80"]
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,20 @@ def _clamp01(v: float) -> float:
 def _open_capture(source: str | int):
     if isinstance(source, int) and os.name == "nt":
         return cv2.VideoCapture(source, cv2.CAP_DSHOW)
+
+    # Network URL sources are best handled by FFmpeg. On Windows, trying MSMF first
+    # adds noisy warnings and doesn't help for RTSP/HTTP streams.
+    if isinstance(source, str) and os.name == "nt":
+        s = source.strip().lower()
+        if s.startswith(("rtsp://", "rtsps://", "http://", "https://", "tcp://", "udp://")):
+            cap_try = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            if cap_try.isOpened():
+                return cap_try
+            try:
+                cap_try.release()
+            except Exception:
+                pass
+            return cv2.VideoCapture(source)
 
     # On Windows, OpenCV+FFmpeg can crash on some videos (libavcodec threading assertions).
     # Prefer Media Foundation for file/URL sources.
@@ -101,6 +117,7 @@ class _ModelHolder:
     def __init__(self, model_candidates: Iterable[Path]):
         self._candidates = list(model_candidates)
         self._model: YOLO | None = None
+        self._selected_path: Path | None = None
         self._lock = threading.Lock()
 
     def get_optional(self) -> YOLO | None:
@@ -113,8 +130,19 @@ class _ModelHolder:
             if model_path is None:
                 return None
 
+            self._selected_path = model_path
             self._model = YOLO(str(model_path))
             return self._model
+
+    def selected_path(self) -> str | None:
+        with self._lock:
+            if self._selected_path is not None:
+                return str(self._selected_path)
+            model_path = next((p for p in self._candidates if p.exists()), None)
+            return str(model_path) if model_path is not None else None
+
+    def candidates(self) -> list[str]:
+        return [str(p) for p in self._candidates]
 
     def get(self) -> YOLO:
         model = self.get_optional()
@@ -142,19 +170,25 @@ class StreamWorker:
         weapon_knife_conf: float = 0.8,
         weapon_persist_frames: int = 3,
         weapon_max_area_ratio: float = 0.3,
+        weapon_no_person_min_conf: float = 0.75,
+        weapon_person_pad_ratio: float = 0.35,
+        weapon_near_person_base_px: int = 260,
         weapon_verify_conf: float = 0.85,
         weapon_verify_imgsz: int = 800,
         weapon_verify_cooldown_s: float = 2.0,
         weapon_verify_retry_s: float = 0.4,
         weapon_verify_window_s: float = 1.5,
+        weapon_verify_required: bool = False,
         weapon_fallback_conf: float = 0.8,
         weapon_fallback_persist_frames: int = 3,
         weapon_allow_person_labels: bool = False,
         weapon_labels_allowlist: set[str] | None = None,
         fps_limit: int = 30,
         infer_imgsz: int = 640,
+        weapon_imgsz: int = 960,
         infer_half: bool = False,
         max_frame_height: int = 720,
+        file_max_frame_height: int = 1080,
         jpeg_quality: int = 80,
         weapon_infer_every_n_frames: int = 1,
         weapon_rearm_seconds: float = 20.0,
@@ -185,11 +219,15 @@ class StreamWorker:
         self._weapon_knife_conf = float(weapon_knife_conf)
         self._weapon_persist_frames = max(1, int(weapon_persist_frames))
         self._weapon_max_area_ratio = float(weapon_max_area_ratio)
+        self._weapon_no_person_min_conf = float(weapon_no_person_min_conf)
+        self._weapon_person_pad_ratio = max(0.0, float(weapon_person_pad_ratio))
+        self._weapon_near_person_base_px = max(50, int(weapon_near_person_base_px))
         self._weapon_verify_conf = float(weapon_verify_conf)
         self._weapon_verify_imgsz = max(128, int(weapon_verify_imgsz))
         self._weapon_verify_cooldown_s = max(0.0, float(weapon_verify_cooldown_s))
         self._weapon_verify_retry_s = max(0.0, float(weapon_verify_retry_s))
         self._weapon_verify_window_s = max(0.1, float(weapon_verify_window_s))
+        self._weapon_verify_required = bool(weapon_verify_required)
         self._weapon_fallback_conf = float(weapon_fallback_conf)
         self._weapon_fallback_persist_frames = max(1, int(weapon_fallback_persist_frames))
         self._weapon_allow_person_labels = bool(weapon_allow_person_labels)
@@ -200,10 +238,20 @@ class StreamWorker:
                 s.strip().lower() for s in (weapon_labels_allowlist or set()) if str(s).strip()
             }
         self._fps_limit = fps_limit
+        if self.mode == "file":
+            # For uploaded files, prioritize detection recall over smooth real-time playback.
+            # Disabling FPS limiting allows scanning through the clip as fast as inference permits.
+            self._fps_limit = 0
 
         self._infer_imgsz = max(128, int(infer_imgsz))
+        self._weapon_imgsz = max(128, int(weapon_imgsz))
         self._infer_half = bool(infer_half)
         self._max_frame_height = max(0, int(max_frame_height))
+        self._file_max_frame_height = max(0, int(file_max_frame_height))
+        if self.mode == "file" and self._file_max_frame_height > 0:
+            # Preserve more detail for uploaded videos (weapons can be small).
+            # Use the larger of the two limits so users can still override via env.
+            self._max_frame_height = max(self._max_frame_height, self._file_max_frame_height)
         self._jpeg_quality = int(jpeg_quality)
         if self._jpeg_quality < 30:
             self._jpeg_quality = 30
@@ -291,6 +339,9 @@ class StreamWorker:
 
         # thresholds (kept same as previous behavior)
         self.LOITER_THRESHOLD = 5
+        # A person must be mostly stationary for this long to count as loitering.
+        # Speeds are in pixels/sec (frame-space after optional resize).
+        self.LOITER_SPEED_THRESHOLD = 25
         self.BAG_THRESHOLD = 5
         self.PERSON_BAG_DISTANCE = 150
         self.RUNNING_SPEED_THRESHOLD = 120
@@ -500,7 +551,9 @@ class StreamWorker:
                     self._history_bucket,
                     storage_key,
                     str(clip_path),
-                    content_type="video/mp4",
+                    content_type=(
+                        "video/webm" if str(clip_path).lower().endswith(".webm") else "video/mp4"
+                    ),
                 )
 
                 # Sidecar metadata for the local history browser
@@ -554,33 +607,46 @@ class StreamWorker:
         out_dir = root / self.stream_id / date_s
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = f"{time_s}.mp4"
-        out_path = out_dir / filename
-        # If the name already exists, add a suffix
-        if out_path.exists():
-            out_path = out_dir / f"{time_s}-{int(now)}.mp4"
+        base_name = time_s
 
         # Use a conservative FPS; if capture reports a reasonable FPS, use it.
         fps = float(self._clip_fps) if self._clip_fps > 1 else 15.0
         size = (int(frame_w), int(frame_h))
 
-        # Prefer browser-friendly H.264 MP4 when available.
-        # Fallback to mp4v if the environment lacks H.264 support.
-        force_mp4v = _bool_env("INTENTWATCH_HISTORY_FORCE_MP4V", os.name == "nt")
+        # Prefer browser-friendly formats.
+        # On Windows, mp4v clips are frequently unplayable in browsers; VP8/WebM is a safer fallback.
+        force_mp4v = _bool_env("INTENTWATCH_HISTORY_FORCE_MP4V", False)
         candidates = ["mp4v"] if force_mp4v else _pick_history_fourcc_candidates()
 
-        writer = None
-        chosen = None
+        def _ext_for_fourcc(code: str) -> str:
+            c = str(code).strip().upper()
+            if c.startswith("VP"):
+                return ".webm"
+            return ".mp4"
+
+        writer: cv2.VideoWriter | None = None
+        chosen: str | None = None
+        out_path: Path | None = None
         for code in candidates:
             try:
-                cc = cv2.VideoWriter_fourcc(*str(code)[:4])
-                w = cv2.VideoWriter(str(out_path), cc, fps, size)
+                ext = _ext_for_fourcc(code)
+                candidate_path = out_dir / f"{base_name}{ext}"
+                if candidate_path.exists():
+                    candidate_path = out_dir / f"{base_name}-{int(now)}{ext}"
+                cc = cv2.VideoWriter_fourcc(*str(code)[:4])  # type: ignore[attr-defined]
+                w = cv2.VideoWriter(str(candidate_path), cc, fps, size)
                 if w.isOpened():
                     writer = w
                     chosen = str(code)[:4]
+                    out_path = candidate_path
                     break
                 try:
                     w.release()
+                except Exception:
+                    pass
+                try:
+                    if candidate_path.exists() and candidate_path.stat().st_size == 0:
+                        candidate_path.unlink(missing_ok=True)
                 except Exception:
                     pass
             except Exception:
@@ -597,6 +663,51 @@ class StreamWorker:
     def _run(self) -> None:
         cap_local = None
         try:
+            reconnect_enabled = bool(self.mode == "camera") and _bool_env(
+                "INTENTWATCH_CAMERA_RECONNECT",
+                True,
+            )
+            try:
+                reconnect_initial_s = float(os.getenv("INTENTWATCH_CAMERA_RECONNECT_INITIAL_S", "0.5") or 0.5)
+            except Exception:
+                reconnect_initial_s = 0.5
+            try:
+                reconnect_max_s = float(os.getenv("INTENTWATCH_CAMERA_RECONNECT_MAX_S", "5.0") or 5.0)
+            except Exception:
+                reconnect_max_s = 5.0
+            if reconnect_initial_s < 0.1:
+                reconnect_initial_s = 0.1
+            if reconnect_max_s < reconnect_initial_s:
+                reconnect_max_s = reconnect_initial_s
+
+            def _reopen_capture_with_backoff() -> bool:
+                nonlocal cap_local
+                if not reconnect_enabled:
+                    return False
+                delay = float(reconnect_initial_s)
+                while not self._stop_event.is_set():
+                    try:
+                        if cap_local is not None:
+                            try:
+                                cap_local.release()
+                            except Exception:
+                                pass
+                        cap_local = _open_capture(self.source)
+                        self._cap = cap_local
+                        if cap_local is not None:
+                            try:
+                                cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            except Exception:
+                                pass
+                        if cap_local is not None and cap_local.isOpened():
+                            return True
+                    except Exception:
+                        pass
+
+                    time.sleep(delay)
+                    delay = min(delay * 1.7, float(reconnect_max_s))
+                return False
+
             cap_local = _open_capture(self.source)
             self._cap = cap_local
 
@@ -609,7 +720,11 @@ class StreamWorker:
                     pass
 
             if cap_local is None or not cap_local.isOpened():
-                return
+                # For live camera streams, keep trying to reconnect instead of exiting.
+                if reconnect_enabled and _reopen_capture_with_backoff():
+                    pass
+                else:
+                    return
 
             try:
                 fps_cap = float(cap_local.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -621,7 +736,7 @@ class StreamWorker:
             # When streaming a local video file, heavy inference can make playback run
             # slower than real-time, which users perceive as "late" labels/alerts.
             # To keep the stream close to real-time, optionally skip frames when behind.
-            file_realtime = bool(self.mode == "file") and _bool_env("INTENTWATCH_FILE_REALTIME", True)
+            file_realtime = bool(self.mode == "file") and _bool_env("INTENTWATCH_FILE_REALTIME", False)
             file_base_ts = time.time()
             file_base_frame = 0
             file_fps = 0.0
@@ -664,8 +779,13 @@ class StreamWorker:
                 nonlocal latest_frame, latest_frame_ts, latest_frame_id
                 try:
                     while not self._stop_event.is_set():
+                        if cap_local is None:
+                            break
                         ret, frm = cap_local.read()
                         if not ret or frm is None:
+                            # Transient camera disconnects are common; try to reconnect.
+                            if reconnect_enabled and _reopen_capture_with_backoff():
+                                continue
                             break
                         ts_now = time.time()
                         with capture_lock:
@@ -730,11 +850,15 @@ class StreamWorker:
 
                     ret, frame = cap_local.read()
                     if not ret or frame is None:
-                        if isinstance(self.source, str):
+                        # File sources: loop to the start on EOF.
+                        if self.mode == "file" and isinstance(self.source, str):
                             cap_local.set(cv2.CAP_PROP_POS_FRAMES, 0)
                             ret, frame = cap_local.read()
                             if not ret or frame is None:
                                 break
+                        # Camera sources: reconnect instead of exiting.
+                        elif reconnect_enabled and _reopen_capture_with_backoff():
+                            continue
                         else:
                             break
 
@@ -808,7 +932,7 @@ class StreamWorker:
                     bx1, by1, bx2, by2 = b
                     return not (ax2 <= bx1 or bx2 <= ax1 or ay2 <= by1 or by2 <= ay1)
 
-                def _near_person(wb: Tuple[int, int, int, int], *, base_px: int = 220) -> bool:
+                def _near_person(wb: Tuple[int, int, int, int], *, base_px: int | None = None) -> bool:
                     """Return True if weapon box is close enough to any detected person.
 
                     We use this instead of requiring strict intersection because many real weapon
@@ -820,26 +944,28 @@ class StreamWorker:
                     x1, y1, x2, y2 = wb
                     wcx = (x1 + x2) // 2
                     wcy = (y1 + y2) // 2
+                    base = int(self._weapon_near_person_base_px) if base_px is None else int(base_px)
                     for (px1, py1, px2, py2, pcx, pcy) in persons:
                         pw = max(1, px2 - px1)
                         ph = max(1, py2 - py1)
                         # Dynamic threshold scales with person size.
-                        thresh = max(int(base_px), int(0.55 * float(max(pw, ph))))
+                        thresh = max(int(base), int(0.55 * float(max(pw, ph))))
                         dx = float(wcx - pcx)
                         dy = float(wcy - pcy)
                         if (dx * dx + dy * dy) <= float(thresh * thresh):
                             return True
                     return False
 
-                def _expanded_person_boxes(pad_ratio: float = 0.2) -> List[Tuple[int, int, int, int]]:
+                def _expanded_person_boxes(pad_ratio: float | None = None) -> List[Tuple[int, int, int, int]]:
                     # Expand person bboxes slightly so a weapon box near a hand
                     # still counts as "associated".
+                    pr = float(self._weapon_person_pad_ratio) if pad_ratio is None else float(pad_ratio)
                     expanded: List[Tuple[int, int, int, int]] = []
                     for (px1, py1, px2, py2, _pcx, _pcy) in persons:
                         pw = max(1, px2 - px1)
                         ph = max(1, py2 - py1)
-                        pad_x = int(pw * pad_ratio)
-                        pad_y = int(ph * pad_ratio)
+                        pad_x = int(pw * pr)
+                        pad_y = int(ph * pr)
                         ex1 = max(0, px1 - pad_x)
                         ey1 = max(0, py1 - pad_y)
                         ex2 = min(w - 1, px2 + pad_x)
@@ -871,20 +997,22 @@ class StreamWorker:
                 self.last_people_count = len(persons)
 
                 # Optional dedicated weapon model: treat any detection as a weapon.
+                weapon_has_gun_this_tick = False
                 if weapon_model is not None:
                     run_weapon = (frame_index % self._weapon_infer_every_n_frames) == 0
+                    weapon_infer_ran = bool(run_weapon)
                     weapon_results = (
                         weapon_model(
                             frame_infer,
                             conf=self._weapon_conf,
-                            imgsz=self._infer_imgsz,
+                            imgsz=self._weapon_imgsz,
                             half=self._infer_half,
                             verbose=False,
                         )
                         if run_weapon
                         else []
                     )
-                    expanded_people = _expanded_person_boxes(pad_ratio=0.25)
+                    expanded_people = _expanded_person_boxes()
                     for wr in weapon_results:
                         for box in wr.boxes:
                             cls = int(box.cls[0])
@@ -902,6 +1030,9 @@ class StreamWorker:
                                 label_norm = "weapon"
 
                             label_alias = _weapon_alias(label_norm)
+
+                            if label_alias == "gun":
+                                weapon_has_gun_this_tick = True
 
                             # If an allowlist is explicitly configured, enforce it.
                             # Otherwise, treat all non-placeholder labels as "weapon" candidates and
@@ -939,10 +1070,15 @@ class StreamWorker:
                             wb = (x1, y1, x2, y2)
                             if expanded_people:
                                 if (not any(_intersects(wb, pb) for pb in expanded_people)) and (not _near_person(wb)):
-                                    continue
+                                    # For uploaded files, be a bit more permissive: person detection can be flaky
+                                    # (occlusion, low-res, motion blur). Keep a higher confidence floor.
+                                    if self.mode != "file":
+                                        continue
+                                    if score < max(self._weapon_conf, self._weapon_no_person_min_conf):
+                                        continue
                             else:
                                 # "weapon" with no person nearby is much more likely to be a false positive.
-                                if score < max(self._weapon_conf, 0.75):
+                                if score < max(self._weapon_conf, self._weapon_no_person_min_conf):
                                     continue
 
                             # Guard against huge "whole frame" boxes which are a common false-positive pattern.
@@ -961,13 +1097,21 @@ class StreamWorker:
 
                             weapon_candidates.append((x1, y1, x2, y2, label, score))
 
-                # Require persistence across frames before declaring a weapon candidate.
-                if weapon_candidates:
-                    self._weapon_streak += 1
+                    # Require persistence across *inference ticks* (not every frame).
+                    # If we are skipping inference for performance, do NOT reset streak on skipped frames.
+                    if run_weapon:
+                        if weapon_candidates:
+                            self._weapon_streak += 1
+                        else:
+                            self._weapon_streak = 0
                 else:
-                    self._weapon_streak = 0
+                    weapon_infer_ran = False
 
-                weapon_primary_ready = bool(weapon_candidates) and (self._weapon_streak >= self._weapon_persist_frames)
+                # Pick per-tick persistence requirement: guns/pistols are often intermittent,
+                # so allow them to trigger with a single strong detection.
+                required_weapon_frames = 1 if (weapon_model is not None and weapon_has_gun_this_tick) else self._weapon_persist_frames
+
+                weapon_primary_ready = bool(weapon_candidates) and (self._weapon_streak >= required_weapon_frames)
 
                 # Fallback: if weapon-type model found nothing, try a "person-with-weapon" model.
                 # This draws a person-sized box labeled "PERSON WITH GUN".
@@ -976,11 +1120,12 @@ class StreamWorker:
                     fallback_candidates.clear()
                     expanded_people = _expanded_person_boxes(pad_ratio=0.15)
                     run_fallback = (frame_index % self._weapon_infer_every_n_frames) == 0
+                    weapon_infer_ran = bool(weapon_infer_ran or run_fallback)
                     fb_results = (
                         weapon_fallback_model(
                             frame_infer,
                             conf=self._weapon_fallback_conf,
-                            imgsz=self._infer_imgsz,
+                            imgsz=self._weapon_imgsz,
                             half=self._infer_half,
                             verbose=False,
                         )
@@ -1003,17 +1148,19 @@ class StreamWorker:
                             # Only allow fallback boxes that intersect a person.
                             # This prevents the fallback model from labeling random objects as "person with gun".
                             if expanded_people:
-                                if (not any(_intersects((x1, y1, x2, y2), pb) for pb in expanded_people)) and (not _near_person((x1, y1, x2, y2), base_px=260)):
+                                if (not any(_intersects((x1, y1, x2, y2), pb) for pb in expanded_people)) and (not _near_person((x1, y1, x2, y2))):
                                     continue
                             else:
                                 # If we can't detect a person at all, avoid triggering fallback.
                                 continue
                             fallback_candidates.append((x1, y1, x2, y2, score))
 
-                    if fallback_candidates:
-                        self._weapon_fallback_streak += 1
-                    else:
-                        self._weapon_fallback_streak = 0
+                    # Same persistence rule: count only inference ticks.
+                    if run_fallback:
+                        if fallback_candidates:
+                            self._weapon_fallback_streak += 1
+                        else:
+                            self._weapon_fallback_streak = 0
 
                     if self._weapon_fallback_streak >= self._weapon_fallback_persist_frames:
                         # Use the highest-confidence box.
@@ -1024,14 +1171,23 @@ class StreamWorker:
                 # Pick a single "event candidate" box/label for verification + alerting.
                 candidate_bbox: Tuple[int, int, int, int] | None = None
                 candidate_label: str | None = None
+                candidate_score: float | None = None
                 if weapon_primary_ready and weapon_candidates:
                     x1, y1, x2, y2, label, _score = max(weapon_candidates, key=lambda t: float(t[5]))
                     candidate_bbox = (int(x1), int(y1), int(x2), int(y2))
                     candidate_label = str(label)
+                    try:
+                        candidate_score = float(_score)
+                    except Exception:
+                        candidate_score = None
                 elif (weapon_fallback_model is not None) and (self._weapon_fallback_streak >= self._weapon_fallback_persist_frames) and fallback_candidates:
                     x1, y1, x2, y2, _score = max(fallback_candidates, key=lambda t: float(t[4]))
                     candidate_bbox = (int(x1), int(y1), int(x2), int(y2))
                     candidate_label = "person with gun"
+                    try:
+                        candidate_score = float(_score)
+                    except Exception:
+                        candidate_score = None
 
                 def _weapon_label_for_overlay(raw_label: str) -> str:
                     # Keep overlay readable even if model has long class names.
@@ -1049,14 +1205,16 @@ class StreamWorker:
                 if weapon_signal:
                     self._weapon_last_seen_ts = now
                 else:
-                    # Reset verify pending state when the weapon is no longer present.
-                    self._weapon_verify_pending_since = None
-                    if (
-                        self._weapon_event_active
-                        and self._weapon_last_seen_ts is not None
-                        and (now - self._weapon_last_seen_ts) >= self._weapon_clear_seconds
-                    ):
-                        self._weapon_event_active = False
+                    # Only clear/decay weapon state when we actually ran weapon inference.
+                    # If we're skipping inference for performance, treat this frame as "unknown".
+                    if weapon_infer_ran:
+                        self._weapon_verify_pending_since = None
+                        if (
+                            self._weapon_event_active
+                            and self._weapon_last_seen_ts is not None
+                            and (now - self._weapon_last_seen_ts) >= self._weapon_clear_seconds
+                        ):
+                            self._weapon_event_active = False
 
                 # If a verify model is configured, suppress weapon overlays unless verification passes.
                 # This prevents "false gun label" in clips where the fast model misfires.
@@ -1080,7 +1238,7 @@ class StreamWorker:
                             # Give up for now; will reset once weapon clears.
                             self._weapon_last_verify_ts = now
                             self._weapon_last_verify_ok = False
-                            return False
+                            return (not self._weapon_verify_required)
 
                         # Cooldown handling:
                         # - If last verify was OK, honor the configured cooldown.
@@ -1147,7 +1305,9 @@ class StreamWorker:
 
                         self._weapon_last_verify_ts = now
                         self._weapon_last_verify_ok = bool(ok)
-                        return bool(ok)
+                        if ok:
+                            return True
+                        return (not self._weapon_verify_required)
 
                     event_start_confirmed = _verify_weapon_event_start()
 
@@ -1287,11 +1447,35 @@ class StreamWorker:
 
                 # Loitering detection
                 if persons:
-                    if self._person_start_time is None:
-                        self._person_start_time = now
-                    elif now - self._person_start_time > self.LOITER_THRESHOLD:
-                        self._emit_alert(add_alert, "Loitering", "Person loitering detected", cooldown_s=5.0, severity="Medium")
-                        self._person_start_time = now
+                    # Treat "loitering" as a person staying relatively stationary.
+                    # This avoids false positives when someone is simply walking through frame.
+                    stationary = False
+                    try:
+                        for pid, hist in self._person_speed_history.items():
+                            if not hist:
+                                continue
+                            recent = hist[-3:] if len(hist) >= 3 else hist
+                            avg_speed = sum(recent) / max(len(recent), 1)
+                            if avg_speed < float(self.LOITER_SPEED_THRESHOLD):
+                                stationary = True
+                                break
+                    except Exception:
+                        stationary = False
+
+                    if stationary:
+                        if self._person_start_time is None:
+                            self._person_start_time = now
+                        elif now - self._person_start_time > self.LOITER_THRESHOLD:
+                            self._emit_alert(
+                                add_alert,
+                                "Loitering",
+                                "Person loitering detected",
+                                cooldown_s=5.0,
+                                severity="Medium",
+                            )
+                            self._person_start_time = now
+                    else:
+                        self._person_start_time = None
                 else:
                     self._person_start_time = None
 
@@ -1482,10 +1666,13 @@ class StreamManager:
         # - Lower conf than 0.85 (too strict, misses guns)
         # - Persistence>1 to suppress single-frame false positives
         # - Slightly larger max box (some models output loose boxes)
-        self._weapon_conf = _env_float("INTENTWATCH_WEAPON_CONF", 0.75)
-        self._weapon_knife_conf = _env_float("INTENTWATCH_WEAPON_KNIFE_CONF", 0.8)
+        self._weapon_conf = _env_float("INTENTWATCH_WEAPON_CONF", 0.35)
+        self._weapon_knife_conf = _env_float("INTENTWATCH_WEAPON_KNIFE_CONF", 0.6)
         self._weapon_persist_frames = _env_int("INTENTWATCH_WEAPON_PERSIST_FRAMES", 2)
         self._weapon_max_area_ratio = _env_float("INTENTWATCH_WEAPON_MAX_AREA_RATIO", 0.6)
+        self._weapon_no_person_min_conf = _env_float("INTENTWATCH_WEAPON_NO_PERSON_MIN_CONF", 0.45)
+        self._weapon_person_pad_ratio = _env_float("INTENTWATCH_WEAPON_PERSON_PAD_RATIO", 0.35)
+        self._weapon_near_person_base_px = _env_int("INTENTWATCH_WEAPON_NEAR_PERSON_BASE_PX", 260)
 
         # Fallback model thresholds (person-with-weapon model).
         # Keep these stricter because this model has historically produced false positives.
@@ -1497,35 +1684,39 @@ class StreamManager:
         self._weapon_clear_seconds = _env_float("INTENTWATCH_WEAPON_CLEAR_SECONDS", 2.0)
 
         # Weapon verification model (secondary model run only at event start).
-        self._weapon_verify_conf = _env_float("INTENTWATCH_WEAPON_VERIFY_CONF", 0.85)
+        self._weapon_verify_conf = _env_float("INTENTWATCH_WEAPON_VERIFY_CONF", 0.6)
         self._weapon_verify_imgsz = _env_int("INTENTWATCH_WEAPON_VERIFY_IMGSZ", 800)
         self._weapon_verify_cooldown_s = _env_float("INTENTWATCH_WEAPON_VERIFY_COOLDOWN_SECONDS", 2.0)
         self._weapon_verify_retry_s = _env_float("INTENTWATCH_WEAPON_VERIFY_RETRY_SECONDS", 0.4)
         self._weapon_verify_window_s = _env_float("INTENTWATCH_WEAPON_VERIFY_WINDOW_SECONDS", 1.5)
+        self._weapon_verify_required = _env_bool("INTENTWATCH_WEAPON_VERIFY_REQUIRED", False)
 
         allow_person_labels_raw = str(os.getenv("INTENTWATCH_WEAPON_ALLOW_PERSON_LABELS", "0")).strip().lower()
         self._weapon_allow_person_labels = allow_person_labels_raw in {"1", "true", "yes", "y", "on"}
 
         labels_env = os.getenv("INTENTWATCH_WEAPON_LABELS")
-        # If INTENTWATCH_WEAPON_LABELS is NOT set, do not enforce an allowlist.
-        # This improves recall for custom single-class weapon models.
-        # If users want strict filtering (e.g., dataset includes non-weapon labels), set it explicitly.
+        # Default allowlist keeps non-weapon classes from triggering weapon alerts (e.g., smartphone/wallet).
+        # If users want to allow *all* classes from their custom weapon model, set:
+        #   INTENTWATCH_WEAPON_LABELS=*
         if labels_env is None:
-            self._weapon_labels_allowlist: set[str] | None = None
+            self._weapon_labels_allowlist = {"pistol", "knife", "gun", "rifle", "weapon", "firearm"}
         else:
-            # IMPORTANT: If the env var is present but empty, do NOT treat it as "allow everything".
-            # That would re-enable false positives for datasets/models that include non-weapon labels.
-            labels_raw = str(labels_env).strip()
-            if not labels_raw:
-                labels_raw = "pistol,knife,gun,rifle,weapon,firearm"
-            self._weapon_labels_allowlist = {s.strip().lower() for s in labels_raw.split(",") if s.strip()}
+            labels_raw = str(labels_env).strip().lower()
+            if labels_raw in {"*", "all", "any"}:
+                self._weapon_labels_allowlist = None
+            else:
+                if not labels_raw:
+                    labels_raw = "pistol,knife,gun,rifle,weapon,firearm"
+                self._weapon_labels_allowlist = {s.strip().lower() for s in labels_raw.split(",") if s.strip()}
 
         # Performance and alert tuning
         # Keep inference image size fixed at 640 for consistent behavior/accuracy.
         # (Do not allow overriding via env var.)
         self._infer_imgsz = 640
+        self._weapon_imgsz = _env_int("INTENTWATCH_WEAPON_IMGSZ", 960)
         self._infer_half = _env_bool("INTENTWATCH_INFER_HALF", False)
         self._max_frame_height = _env_int("INTENTWATCH_MAX_FRAME_HEIGHT", 720)
+        self._file_max_frame_height = _env_int("INTENTWATCH_FILE_MAX_FRAME_HEIGHT", 1080)
         self._jpeg_quality = _env_int("INTENTWATCH_JPEG_QUALITY", 80)
         self._weapon_infer_every_n_frames = _env_int("INTENTWATCH_WEAPON_INFER_EVERY_N_FRAMES", 1)
 
@@ -1586,18 +1777,24 @@ class StreamManager:
                 weapon_knife_conf=self._weapon_knife_conf,
                 weapon_persist_frames=self._weapon_persist_frames,
                 weapon_max_area_ratio=self._weapon_max_area_ratio,
+                weapon_no_person_min_conf=self._weapon_no_person_min_conf,
+                weapon_person_pad_ratio=self._weapon_person_pad_ratio,
+                weapon_near_person_base_px=self._weapon_near_person_base_px,
                 weapon_verify_conf=self._weapon_verify_conf,
                 weapon_verify_imgsz=self._weapon_verify_imgsz,
                 weapon_verify_cooldown_s=self._weapon_verify_cooldown_s,
                 weapon_verify_retry_s=self._weapon_verify_retry_s,
                 weapon_verify_window_s=self._weapon_verify_window_s,
+                weapon_verify_required=self._weapon_verify_required,
                 weapon_fallback_conf=self._weapon_fallback_conf,
                 weapon_fallback_persist_frames=self._weapon_fallback_persist_frames,
                 weapon_allow_person_labels=self._weapon_allow_person_labels,
                 weapon_labels_allowlist=self._weapon_labels_allowlist,
                 infer_imgsz=self._infer_imgsz,
+                weapon_imgsz=self._weapon_imgsz,
                 infer_half=self._infer_half,
                 max_frame_height=self._max_frame_height,
+                file_max_frame_height=self._file_max_frame_height,
                 jpeg_quality=self._jpeg_quality,
                 weapon_infer_every_n_frames=self._weapon_infer_every_n_frames,
                 weapon_rearm_seconds=self._weapon_rearm_seconds,
@@ -1628,8 +1825,18 @@ class StreamManager:
 
     def start(self, stream_id: str, source: str | int, mode: str) -> None:
         with self._lock:
-            # Stop any existing worker first
+            # Idempotent start: if the stream is already running with the same source/mode,
+            # avoid rapid stop/start cycles (which can destabilize native decoders).
             existing = self._workers.get(stream_id)
+            existing_src = self._sources.get(stream_id)
+            if (
+                existing is not None
+                and existing_src == (source, mode)
+                and existing.is_running()
+            ):
+                return
+
+            # Stop any existing worker first
             if existing is not None:
                 existing.stop()
                 existing.join(timeout=2.0)
@@ -1646,16 +1853,24 @@ class StreamManager:
                 weapon_knife_conf=self._weapon_knife_conf,
                 weapon_persist_frames=self._weapon_persist_frames,
                 weapon_max_area_ratio=self._weapon_max_area_ratio,
+                weapon_no_person_min_conf=self._weapon_no_person_min_conf,
+                weapon_person_pad_ratio=self._weapon_person_pad_ratio,
+                weapon_near_person_base_px=self._weapon_near_person_base_px,
                 weapon_verify_conf=self._weapon_verify_conf,
                 weapon_verify_imgsz=self._weapon_verify_imgsz,
                 weapon_verify_cooldown_s=self._weapon_verify_cooldown_s,
+                weapon_verify_retry_s=self._weapon_verify_retry_s,
+                weapon_verify_window_s=self._weapon_verify_window_s,
+                weapon_verify_required=self._weapon_verify_required,
                 weapon_fallback_conf=self._weapon_fallback_conf,
                 weapon_fallback_persist_frames=self._weapon_fallback_persist_frames,
                 weapon_allow_person_labels=self._weapon_allow_person_labels,
                 weapon_labels_allowlist=self._weapon_labels_allowlist,
                 infer_imgsz=self._infer_imgsz,
+                weapon_imgsz=self._weapon_imgsz,
                 infer_half=self._infer_half,
                 max_frame_height=self._max_frame_height,
+                file_max_frame_height=self._file_max_frame_height,
                 jpeg_quality=self._jpeg_quality,
                 weapon_infer_every_n_frames=self._weapon_infer_every_n_frames,
                 weapon_rearm_seconds=self._weapon_rearm_seconds,
@@ -1703,6 +1918,63 @@ class StreamManager:
 
         source, mode = src
         return {"mode": mode, "path": source, "running": bool(worker and worker.is_running())}
+
+    def model_diagnostics(self) -> Dict[str, Any]:
+        """Return model paths + relevant detection config (best-effort)."""
+        def _names(mh: _ModelHolder | None) -> Dict[int, str] | None:
+            if mh is None:
+                return None
+            try:
+                m = mh.get_optional()
+                return dict(m.names) if m is not None else None
+            except Exception:
+                return None
+
+        return {
+            "models": {
+                "main": {
+                    "selected": self._model_holder.selected_path(),
+                    "candidates": self._model_holder.candidates(),
+                    "names": _names(self._model_holder),
+                },
+                "weapon": {
+                    "selected": self._weapon_model_holder.selected_path() if self._weapon_model_holder else None,
+                    "candidates": self._weapon_model_holder.candidates() if self._weapon_model_holder else [],
+                    "names": _names(self._weapon_model_holder),
+                },
+                "weapon_verify": {
+                    "selected": self._weapon_verify_model_holder.selected_path() if self._weapon_verify_model_holder else None,
+                    "candidates": self._weapon_verify_model_holder.candidates() if self._weapon_verify_model_holder else [],
+                    "names": _names(self._weapon_verify_model_holder),
+                },
+                "weapon_fallback": {
+                    "selected": self._weapon_fallback_model_holder.selected_path() if self._weapon_fallback_model_holder else None,
+                    "candidates": self._weapon_fallback_model_holder.candidates() if self._weapon_fallback_model_holder else [],
+                    "names": _names(self._weapon_fallback_model_holder),
+                },
+            },
+            "weapon_config": {
+                "weapon_conf": self._weapon_conf,
+                "weapon_knife_conf": self._weapon_knife_conf,
+                "weapon_persist_frames": self._weapon_persist_frames,
+                "weapon_max_area_ratio": self._weapon_max_area_ratio,
+                "weapon_no_person_min_conf": self._weapon_no_person_min_conf,
+                "weapon_person_pad_ratio": self._weapon_person_pad_ratio,
+                "weapon_near_person_base_px": self._weapon_near_person_base_px,
+                "weapon_infer_every_n_frames": self._weapon_infer_every_n_frames,
+                "weapon_imgsz": self._weapon_imgsz,
+                "weapon_verify_conf": self._weapon_verify_conf,
+                "weapon_verify_imgsz": self._weapon_verify_imgsz,
+                "weapon_verify_required": self._weapon_verify_required,
+                "weapon_verify_window_s": self._weapon_verify_window_s,
+                "weapon_verify_retry_s": self._weapon_verify_retry_s,
+                "weapon_verify_cooldown_s": self._weapon_verify_cooldown_s,
+                "weapon_allow_person_labels": self._weapon_allow_person_labels,
+                "weapon_labels_allowlist": sorted(self._weapon_labels_allowlist) if self._weapon_labels_allowlist is not None else None,
+                "max_frame_height": self._max_frame_height,
+                "file_max_frame_height": self._file_max_frame_height,
+            },
+        }
 
     def set_zones(self, stream_id: str, zones: List[NormalizedZone]) -> None:
         worker = self.get_worker(stream_id)

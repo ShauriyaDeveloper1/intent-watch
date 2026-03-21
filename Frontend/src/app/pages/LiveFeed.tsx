@@ -13,6 +13,7 @@ import {
   Activity,
   Camera,
   Plus,
+  Trash2,
 } from 'lucide-react';
 import { API_BASE_URL, alertsAPI, videoAPI, Alert } from '../../services/api';
 import { ensureNotificationPermissionNonBlocking } from '../../services/alertNotifications';
@@ -23,6 +24,7 @@ export function LiveFeed() {
   const reduceMotion = useReducedMotion();
 
   const [isStreaming, setIsStreaming] = useState(false);
+  const [primaryMode, setPrimaryMode] = useState<string | null>(null);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -80,6 +82,18 @@ export function LiveFeed() {
     try {
       const byId = loadSavedCamerasById();
       byId[cam.id] = { id: cam.id, source: cam.source, name: cam.name };
+      window.localStorage.setItem(CAMERA_STORAGE_KEY, JSON.stringify(Object.values(byId)));
+    } catch {
+      // ignore
+    }
+  };
+
+  const removeSavedCamera = (cameraId: string) => {
+    const id = String(cameraId || '').trim();
+    if (!id || id === 'primary') return;
+    try {
+      const byId = loadSavedCamerasById();
+      delete byId[id];
       window.localStorage.setItem(CAMERA_STORAGE_KEY, JSON.stringify(Object.values(byId)));
     } catch {
       // ignore
@@ -174,7 +188,9 @@ export function LiveFeed() {
 
         const primary = streams.find((s: any) => String(s?.id) === 'primary');
         const primaryRunning = Boolean(primary?.running);
+        const nextPrimaryMode = primary?.mode != null ? String(primary.mode) : null;
         setIsStreaming(primaryRunning);
+        setPrimaryMode(nextPrimaryMode);
         if (primaryRunning) {
           setStreamNonce((n) => n + 1);
         }
@@ -246,6 +262,7 @@ export function LiveFeed() {
         await videoAPI.stopVideo();
         if (isMountedRef.current) {
           setIsStreaming(false);
+          setPrimaryMode(null);
         }
         reconnectAttemptsRef.current = 0;
         return;
@@ -268,6 +285,7 @@ export function LiveFeed() {
       if (isMountedRef.current) {
         setStreamNonce((n) => n + 1);
         setIsStreaming(true);
+        setPrimaryMode('camera');
       }
     } catch (e: any) {
       if (isMountedRef.current) {
@@ -321,6 +339,8 @@ export function LiveFeed() {
       if (isMountedRef.current) {
         setStreamNonce((n) => n + 1);
         setIsStreaming(true);
+        setPrimaryMode('file');
+        setSelectedStreamId('primary');
       }
     } catch (e: any) {
       if (isMountedRef.current) setError(e?.message || 'Failed to upload video');
@@ -418,6 +438,42 @@ export function LiveFeed() {
     }
   };
 
+  const handleDeleteCamera = async (streamId: string) => {
+    const id = String(streamId || '').trim();
+    if (!id || id === 'primary') return;
+
+    setIsLoading(true);
+    setError(null);
+    try {
+      if (extraStreaming[id]) {
+        try {
+          await withTimeout(videoAPI.stopStream(id), 8000, 'Stopping camera');
+        } catch {
+          // ignore stop errors; deletion should still proceed
+        }
+      }
+
+      removeSavedCamera(id);
+
+      if (isMountedRef.current) {
+        setExtraStreams((prev) => prev.filter((c) => c.id !== id));
+        setExtraStreaming((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+        setExtraStreamNonce((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+        setSelectedStreamId((cur) => (cur === id ? null : cur));
+      }
+    } finally {
+      if (isMountedRef.current) setIsLoading(false);
+    }
+  };
+
   const getSeverityColor = (type: string) => {
     const t = (type || '').toLowerCase();
     if (t.includes('weapon')) return 'text-red-400';
@@ -438,6 +494,7 @@ export function LiveFeed() {
   const gridColumns = computeGridColumns(tileCount);
 
   const renderPrimaryTile = () => {
+    const isFile = primaryMode === 'file';
     return (
       <div
         className="relative aspect-video bg-black overflow-hidden cursor-pointer"
@@ -487,21 +544,26 @@ export function LiveFeed() {
               }}
             />
 
-            <div className="absolute top-2 left-2">
-              <Badge className="bg-red-600 text-white">LIVE</Badge>
-            </div>
+            {!isFile && (
+              <div className="absolute top-2 left-2">
+                <Badge className="bg-red-600 text-white">LIVE</Badge>
+              </div>
+            )}
             <div className="absolute bottom-2 left-2">
               <div className="bg-black/50 text-white text-xs px-2 py-1 rounded backdrop-blur-sm">Primary</div>
             </div>
-            <div className="absolute bottom-2 right-2 flex gap-2">
-              <div className="bg-black/50 text-white text-xs px-2 py-1 rounded backdrop-blur-sm">
-                <Activity className="w-3 h-3 inline mr-1" />
-                AI Active
+
+            {!isFile && (
+              <div className="absolute bottom-2 right-2 flex gap-2">
+                <div className="bg-black/50 text-white text-xs px-2 py-1 rounded backdrop-blur-sm">
+                  <Activity className="w-3 h-3 inline mr-1" />
+                  AI Active
+                </div>
+                <div className="bg-black/50 text-white text-xs px-2 py-1 rounded backdrop-blur-sm">
+                  {new Date(clockNow).toLocaleTimeString()}
+                </div>
               </div>
-              <div className="bg-black/50 text-white text-xs px-2 py-1 rounded backdrop-blur-sm">
-                {new Date(clockNow).toLocaleTimeString()}
-              </div>
-            </div>
+            )}
           </>
         ) : (
           <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-slate-800 to-slate-900">
@@ -524,6 +586,22 @@ export function LiveFeed() {
         className="relative aspect-video bg-black overflow-hidden cursor-pointer"
         onClick={() => setSelectedStreamId(cam.id)}
       >
+        <div className="absolute top-2 right-2 z-10 flex gap-2" onClick={(e) => e.stopPropagation()}>
+          {running && (
+            <Button variant="outline" onClick={() => handleStopExtraStream(cam.id)}>
+              <Pause className="w-4 h-4" />
+            </Button>
+          )}
+          <Button
+            variant="outline"
+            onClick={() => handleDeleteCamera(cam.id)}
+            disabled={isLoading}
+            title="Delete camera"
+          >
+            <Trash2 className="w-4 h-4" />
+          </Button>
+        </div>
+
         {running ? (
           <>
             <img
@@ -555,12 +633,6 @@ export function LiveFeed() {
                 {new Date(clockNow).toLocaleTimeString()}
               </div>
             </div>
-
-            <div className="absolute top-2 right-2 flex gap-2" onClick={(e) => e.stopPropagation()}>
-              <Button variant="outline" onClick={() => handleStopExtraStream(cam.id)}>
-                <Pause className="w-4 h-4" />
-              </Button>
-            </div>
           </>
         ) : (
           <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-slate-800 to-slate-900">
@@ -587,17 +659,20 @@ export function LiveFeed() {
     const running = getStreamRunningById(id);
     const cam = isPrimary ? null : extraStreamsRef.current.find((s) => s.id === id);
     const name = isPrimary ? 'Primary' : getCameraDisplayName(cam);
+    const isFile = isPrimary && primaryMode === 'file';
 
     return (
       <div className="space-y-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Badge className={running ? 'bg-red-600 text-white' : 'bg-slate-500/10 text-slate-300 border-slate-500/20'}>
-              {running ? 'LIVE' : 'STOPPED'}
-            </Badge>
+            {!isFile && (
+              <Badge className={running ? 'bg-red-600 text-white' : 'bg-slate-500/10 text-slate-300 border-slate-500/20'}>
+                {running ? 'LIVE' : 'STOPPED'}
+              </Badge>
+            )}
             <div className="text-sm text-foreground font-medium">{name}</div>
           </div>
-          <div className="text-xs text-muted-foreground">Double click video to go back</div>
+          {!isFile && <div className="text-xs text-muted-foreground">Double click video to go back</div>}
         </div>
 
         <div
@@ -623,13 +698,17 @@ export function LiveFeed() {
           )}
 
           <div className="absolute bottom-2 right-2 flex gap-2">
-            <div className="bg-black/50 text-white text-xs px-2 py-1 rounded backdrop-blur-sm">
-              <Activity className="w-3 h-3 inline mr-1" />
-              AI Active
-            </div>
-            <div className="bg-black/50 text-white text-xs px-2 py-1 rounded backdrop-blur-sm">
-              {new Date(clockNow).toLocaleTimeString()}
-            </div>
+            {!isFile && (
+              <>
+                <div className="bg-black/50 text-white text-xs px-2 py-1 rounded backdrop-blur-sm">
+                  <Activity className="w-3 h-3 inline mr-1" />
+                  AI Active
+                </div>
+                <div className="bg-black/50 text-white text-xs px-2 py-1 rounded backdrop-blur-sm">
+                  {new Date(clockNow).toLocaleTimeString()}
+                </div>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -704,6 +783,8 @@ export function LiveFeed() {
             <div className="overflow-auto">
               {selectedStreamId ? (
                 renderSelectedView(selectedStreamId)
+              ) : primaryMode === 'file' && isStreaming ? (
+                renderSelectedView('primary')
               ) : (
                 <div className="bg-black border border-slate-700">
                   <div
