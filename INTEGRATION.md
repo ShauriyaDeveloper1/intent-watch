@@ -197,6 +197,13 @@ GET /alerts/live → Returns array of alerts
 | GET | `/alerts/analytics` | Get analytics data | ✅ Connected |
 | POST | `/alerts/clear` | Clear all alerts | ✅ Connected |
 
+### IoT Endpoints
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/iot/door` | Send door sensor events (ESP8266 + reed switch) |
+
+See: `docs/IOT_DOOR_SENSOR.md`
+
 ---
 
 ## 🎞️ History (Local) + Supabase (Optional)

@@ -11,7 +11,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import { mockStats, generateActivityData, generateAlertDistribution, generateMockAlerts } from '../data/mockData';
 import { Badge } from '../components/ui/badge';
-import { alertsAPI, AnalyticsData, systemAPI } from '../../services/api';
+import { aiAPI, alertsAPI, AnalyticsData, API_BASE_URL, demoAPI, DemoDetectImageResponse, systemAPI } from '../../services/api';
+import { Button } from '../components/ui/button';
+import { Input } from '../components/ui/input';
 
 const StatCard = ({ icon: Icon, label, value, trend, color }: any) => (
   <Card className="p-6">
@@ -37,6 +39,25 @@ export function Dashboard() {
   const [analytics, setAnalytics] = useState<AnalyticsData | null>(null);
   const [hasLoadedAnalytics, setHasLoadedAnalytics] = useState(false);
   const [metrics, setMetrics] = useState<any | null>(null);
+
+  const [demoFile, setDemoFile] = useState<File | null>(null);
+  const [demoLoading, setDemoLoading] = useState(false);
+  const [demoError, setDemoError] = useState<string | null>(null);
+  const [demoResult, setDemoResult] = useState<DemoDetectImageResponse | null>(null);
+
+  const [askQuestion, setAskQuestion] = useState('');
+  const [askAnswer, setAskAnswer] = useState<string>('');
+  const [askSources, setAskSources] = useState<any[]>([]);
+  const [askLoading, setAskLoading] = useState(false);
+  const [askError, setAskError] = useState<string | null>(null);
+
+  const resolveSnapshotUrl = (raw: string | null | undefined) => {
+    const s = String(raw || '').trim();
+    if (!s) return null;
+    if (s.startsWith('http://') || s.startsWith('https://')) return s;
+    if (s.startsWith('/')) return `${API_BASE_URL}${s}`;
+    return `${API_BASE_URL}/${s}`;
+  };
 
   useEffect(() => {
     let isMounted = true;
@@ -263,6 +284,151 @@ export function Dashboard() {
             </div>
           ))}
         </div>
+      </Card>
+
+      {/* Demo: Upload Image (no streaming) */}
+      <Card className="p-6">
+        <h3 className="text-lg font-semibold text-foreground mb-4">Demo: Upload Image</h3>
+
+        <div className="flex flex-col md:flex-row gap-3">
+          <Input
+            type="file"
+            accept="image/*"
+            onChange={(e: any) => {
+              const f = (e?.target?.files && e.target.files[0]) || null;
+              setDemoFile(f);
+              setDemoError(null);
+              setDemoResult(null);
+            }}
+          />
+          <Button
+            disabled={demoLoading || !demoFile}
+            onClick={() => {
+              void (async () => {
+                if (!demoFile) return;
+                setDemoLoading(true);
+                setDemoError(null);
+                try {
+                  const res = await demoAPI.detectImage(demoFile, { stream_id: 'demo', emit_alert: true });
+                  setDemoResult(res);
+                } catch (e: any) {
+                  setDemoError(e?.message || 'Demo detection failed');
+                } finally {
+                  setDemoLoading(false);
+                }
+              })();
+            }}
+          >
+            {demoLoading ? 'Running…' : 'Upload Image'}
+          </Button>
+        </div>
+
+        {demoError && <p className="text-sm text-red-400 mt-3">{demoError}</p>}
+
+        {demoResult && (
+          <div className="mt-4 space-y-3">
+            {demoResult.snapshot_url && (
+              <a
+                href={resolveSnapshotUrl(demoResult.snapshot_url)}
+                target="_blank"
+                rel="noreferrer"
+                className="block rounded border border-border overflow-hidden bg-black"
+                title="Open annotated snapshot"
+              >
+                <img
+                  src={resolveSnapshotUrl(demoResult.snapshot_url) || undefined}
+                  alt="annotated"
+                  className="w-full max-h-96 object-contain"
+                />
+              </a>
+            )}
+
+            <div className="rounded-lg border border-border bg-muted/30 p-4">
+              <p className="text-sm text-muted-foreground">Detections</p>
+              {demoResult.detections?.length ? (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {demoResult.detections
+                    .slice(0, 12)
+                    .map((d, idx) => (
+                      <Badge key={`${d.label}-${idx}`} variant="outline">
+                        {d.label} ({(d.confidence ?? 0).toFixed(2)})
+                      </Badge>
+                    ))}
+                </div>
+              ) : (
+                <p className="mt-2 text-sm text-foreground">No objects detected.</p>
+              )}
+              <p className="mt-3 text-xs text-muted-foreground">
+                This also emits a Weapon alert so the Dashboard updates.
+              </p>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {/* Ask AI (RAG) */}
+      <Card className="p-6">
+        <h3 className="text-lg font-semibold text-foreground mb-4">Ask AI (Alerts)</h3>
+
+        <div className="flex flex-col md:flex-row gap-3">
+          <Input
+            value={askQuestion}
+            onChange={(e) => setAskQuestion(e.target.value)}
+            placeholder="Ask about recent alerts (e.g., What happened last night?)"
+          />
+          <Button
+            disabled={askLoading || !askQuestion.trim()}
+            onClick={() => {
+              void (async () => {
+                setAskLoading(true);
+                setAskError(null);
+                try {
+                  const res = await aiAPI.ask(askQuestion.trim(), { k: 5, max_alerts: 1000 });
+                  setAskAnswer(String(res?.answer ?? ''));
+                  setAskSources(Array.isArray((res as any)?.sources) ? (res as any).sources : []);
+                } catch (e: any) {
+                  setAskError(e?.message || 'Failed to ask AI');
+                } finally {
+                  setAskLoading(false);
+                }
+              })();
+            }}
+          >
+            {askLoading ? 'Asking…' : 'Ask'}
+          </Button>
+        </div>
+
+        {askError && <p className="text-sm text-red-400 mt-3">{askError}</p>}
+
+        {askAnswer && (
+          <pre className="mt-4 whitespace-pre-wrap rounded-lg border border-border bg-muted/30 p-4 text-sm text-foreground">
+            {askAnswer}
+          </pre>
+        )}
+
+        {askSources.length > 0 && (
+          <div className="mt-4">
+            <p className="text-sm text-muted-foreground mb-2">Related snapshots</p>
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+              {askSources.map((s: any, idx: number) => {
+                const url = resolveSnapshotUrl(s?.snapshot_url);
+                if (!url) return null;
+                return (
+                  <a
+                    key={`${s?.id ?? idx}`}
+                    href={url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block rounded border border-border overflow-hidden bg-black"
+                    title={String(s?.type ?? 'Alert')}
+                  >
+                    <img src={url} alt={String(s?.type ?? 'snapshot')} className="w-full h-24 object-cover" />
+                  </a>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </Card>
     </div>
   );

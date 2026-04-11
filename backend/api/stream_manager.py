@@ -13,6 +13,23 @@ import cv2
 from ultralytics import YOLO
 
 
+import functools
+
+
+@functools.lru_cache(maxsize=1)
+def _cuda_available() -> bool:
+    """Best-effort CUDA availability check.
+
+    Used only to choose defaults. Falls back to False if torch isn't importable.
+    """
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 # Disable FFmpeg threading to avoid codec errors
 os.environ.setdefault("FFREPORT", "file=/dev/null")
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "threads;1")
@@ -237,11 +254,10 @@ class StreamWorker:
             self._weapon_labels_allowlist = {
                 s.strip().lower() for s in (weapon_labels_allowlist or set()) if str(s).strip()
             }
-        self._fps_limit = fps_limit
-        if self.mode == "file":
-            # For uploaded files, prioritize detection recall over smooth real-time playback.
-            # Disabling FPS limiting allows scanning through the clip as fast as inference permits.
-            self._fps_limit = 0
+        # FPS limiting applies to both camera and file streams.
+        # For uploaded videos this helps keep UI playback smooth and avoids pegging CPU
+        # by running inference+encoding as fast as possible.
+        self._fps_limit = max(0, int(fps_limit))
 
         self._infer_imgsz = max(128, int(infer_imgsz))
         self._weapon_imgsz = max(128, int(weapon_imgsz))
@@ -258,7 +274,47 @@ class StreamWorker:
         if self._jpeg_quality > 95:
             self._jpeg_quality = 95
 
+        # File-mode MJPEG encoding can be the bottleneck on CPU-bound machines.
+        # Use a slightly lower default quality for uploaded videos to improve smoothness.
+        if self.mode == "file":
+            try:
+                file_q = int(os.getenv("INTENTWATCH_FILE_JPEG_QUALITY", "60"))
+            except Exception:
+                file_q = 60
+            if file_q > 0:
+                file_q = 30 if file_q < 30 else 95 if file_q > 95 else file_q
+                self._jpeg_quality = min(self._jpeg_quality, int(file_q))
+
         self._weapon_infer_every_n_frames = max(1, int(weapon_infer_every_n_frames))
+
+        # File-mode performance tuning (defaults favor smooth playback).
+        # These can be overridden via env vars without affecting camera streams.
+        if self.mode == "file":
+            # Base detector: reduce imgsz in file mode for better throughput on CPU.
+            # This trades some accuracy for smoother playback.
+            try:
+                file_infer_imgsz = int(os.getenv("INTENTWATCH_FILE_INFER_IMGSZ", "320"))
+            except Exception:
+                file_infer_imgsz = 320
+            if file_infer_imgsz > 0:
+                self._infer_imgsz = max(128, min(self._infer_imgsz, int(file_infer_imgsz)))
+
+            # Reduce expensive weapon-model inference frequency for uploaded clips.
+            try:
+                file_weapon_every = int(os.getenv("INTENTWATCH_FILE_WEAPON_INFER_EVERY_N_FRAMES", "2"))
+            except Exception:
+                file_weapon_every = 2
+            if file_weapon_every > 1:
+                self._weapon_infer_every_n_frames = max(self._weapon_infer_every_n_frames, file_weapon_every)
+
+            # Lower weapon model input size by default for better throughput.
+            # (768 is a reasonable balance vs the default 960.)
+            try:
+                file_weapon_imgsz = int(os.getenv("INTENTWATCH_FILE_WEAPON_IMGSZ", "768"))
+            except Exception:
+                file_weapon_imgsz = 768
+            if file_weapon_imgsz > 0:
+                self._weapon_imgsz = max(128, min(self._weapon_imgsz, int(file_weapon_imgsz)))
         self._weapon_rearm_seconds = max(0.0, float(weapon_rearm_seconds))
         self._weapon_clear_seconds = max(0.0, float(weapon_clear_seconds))
         self._running_persist_frames = max(1, int(running_persist_frames))
@@ -279,6 +335,8 @@ class StreamWorker:
         # Detection state
         self._person_start_time: float | None = None
         self._bag_start_time: float | None = None
+        self._bag_last_seen_ts: float | None = None
+        self._bag_last_bbox: Tuple[int, int, int, int] | None = None
         self._person_positions: Dict[int, Tuple[int, int, float]] = {}
         self._person_speed_history: Dict[int, List[float]] = {}
 
@@ -309,6 +367,9 @@ class StreamWorker:
 
         # Zone dwell tracking (zone id -> first time person observed inside)
         self._zone_presence_start: Dict[str, float] = {}
+
+        # Zone entry tracking for restricted zones (zone id -> set of person IDs currently inside)
+        self._zone_prev_person_ids: Dict[str, set[int]] = {}
 
         # History recording
         self._history_enabled = bool(history_enabled) and (self.mode == "camera")
@@ -342,8 +403,23 @@ class StreamWorker:
         # A person must be mostly stationary for this long to count as loitering.
         # Speeds are in pixels/sec (frame-space after optional resize).
         self.LOITER_SPEED_THRESHOLD = 25
-        self.BAG_THRESHOLD = 5
-        self.PERSON_BAG_DISTANCE = 150
+        # Unattended bag: tune these based on camera angle and scene scale.
+        # - Lower distance => fewer false positives (requires bag to be closer to person to be considered attended)
+        # - Higher time threshold => fewer transient false positives
+        try:
+            self.BAG_THRESHOLD = max(0.0, float(os.getenv("INTENTWATCH_BAG_THRESHOLD_SECONDS", "5")))
+        except Exception:
+            self.BAG_THRESHOLD = 5.0
+        try:
+            self.PERSON_BAG_DISTANCE = max(0, int(os.getenv("INTENTWATCH_PERSON_BAG_DISTANCE_PX", "150")))
+        except Exception:
+            self.PERSON_BAG_DISTANCE = 150
+        # Allow brief gaps in bag detections (e.g., missed frames) without resetting the timer.
+        # This helps ensure the alert can still fire on noisy/low-quality streams.
+        try:
+            self.BAG_MISSING_GRACE_SECONDS = max(0.0, float(os.getenv("INTENTWATCH_BAG_MISSING_GRACE_SECONDS", "1.0")))
+        except Exception:
+            self.BAG_MISSING_GRACE_SECONDS = 1.0
         self.RUNNING_SPEED_THRESHOLD = 120
 
     def start(self) -> None:
@@ -733,10 +809,20 @@ class StreamWorker:
             except Exception:
                 pass
 
+            # If processing is faster than the file's native FPS, the MJPEG stream can
+            # appear "fast-forward". Cap output FPS to the file FPS when we can detect it.
+            if self.mode == "file" and self._fps_limit > 0:
+                try:
+                    fps_cap_limit = int(round(float(self._clip_fps)))
+                except Exception:
+                    fps_cap_limit = 0
+                if fps_cap_limit and 1 <= fps_cap_limit <= 120:
+                    self._fps_limit = min(self._fps_limit, fps_cap_limit)
+
             # When streaming a local video file, heavy inference can make playback run
             # slower than real-time, which users perceive as "late" labels/alerts.
             # To keep the stream close to real-time, optionally skip frames when behind.
-            file_realtime = bool(self.mode == "file") and _bool_env("INTENTWATCH_FILE_REALTIME", False)
+            file_realtime = bool(self.mode == "file") and _bool_env("INTENTWATCH_FILE_REALTIME", True)
             file_base_ts = time.time()
             file_base_frame = 0
             file_fps = 0.0
@@ -865,8 +951,10 @@ class StreamWorker:
                     now = time.time()
                     cap_frame_idx += 1
 
-                # Basic FPS limiting (camera streams only).
-                if (not file_realtime) and self._fps_limit > 0:
+                # Basic FPS limiting.
+                # Note: even in file "real-time" mode, keep this enabled so playback
+                # doesn't run faster than wall time when GPU inference is very fast.
+                if self._fps_limit > 0:
                     min_dt = 1.0 / float(self._fps_limit)
                     if (now - last_yield) < min_dt:
                         time.sleep(max(min_dt - (now - last_yield), 0.0))
@@ -902,19 +990,39 @@ class StreamWorker:
                 fallback_candidates: List[Tuple[int, int, int, int, float]] = []
 
                 weapon_model = (
-                    self._weapon_model_holder.get_optional() if self._weapon_model_holder is not None else None
+                    None
+                    if (
+                        self._weapon_model_holder is None
+                        or (
+                            self.mode == "file"
+                            and (not _bool_env("INTENTWATCH_FILE_WEAPON_ENABLED", _cuda_available()))
+                        )
+                    )
+                    else self._weapon_model_holder.get_optional()
                 )
 
                 weapon_verify_model = (
-                    self._weapon_verify_model_holder.get_optional()
-                    if self._weapon_verify_model_holder is not None
-                    else None
+                    None
+                    if (
+                        self._weapon_verify_model_holder is None
+                        or (
+                            self.mode == "file"
+                            and (not _bool_env("INTENTWATCH_FILE_WEAPON_ENABLED", _cuda_available()))
+                        )
+                    )
+                    else self._weapon_verify_model_holder.get_optional()
                 )
 
                 weapon_fallback_model = (
-                    self._weapon_fallback_model_holder.get_optional()
-                    if self._weapon_fallback_model_holder is not None
-                    else None
+                    None
+                    if (
+                        self._weapon_fallback_model_holder is None
+                        or (
+                            self.mode == "file"
+                            and (not _bool_env("INTENTWATCH_FILE_WEAPON_ENABLED", _cuda_available()))
+                        )
+                    )
+                    else self._weapon_fallback_model_holder.get_optional()
                 )
 
                 def _weapon_alias(label_norm: str) -> str:
@@ -974,10 +1082,17 @@ class StreamWorker:
                     return expanded
 
                 # Gather detections
+                main_names: Dict[int, str] = {}
+                try:
+                    n = getattr(model, "names", None)
+                    if isinstance(n, dict):
+                        main_names = {int(k): str(v) for k, v in n.items()}
+                except Exception:
+                    main_names = {}
                 for r in results:
                     for box in r.boxes:
                         cls = int(box.cls[0])
-                        label = str(model.names.get(cls, cls))
+                        label = str(main_names.get(cls, cls))
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         cx = (x1 + x2) // 2
                         cy = (y1 + y2) // 2
@@ -999,6 +1114,14 @@ class StreamWorker:
                 # Optional dedicated weapon model: treat any detection as a weapon.
                 weapon_has_gun_this_tick = False
                 if weapon_model is not None:
+                    assert weapon_model is not None
+                    weapon_names: Dict[int, str] = {}
+                    try:
+                        wn = getattr(weapon_model, "names", None)
+                        if isinstance(wn, dict):
+                            weapon_names = {int(k): str(v) for k, v in wn.items()}
+                    except Exception:
+                        weapon_names = {}
                     run_weapon = (frame_index % self._weapon_infer_every_n_frames) == 0
                     weapon_infer_ran = bool(run_weapon)
                     weapon_results = (
@@ -1016,7 +1139,7 @@ class StreamWorker:
                     for wr in weapon_results:
                         for box in wr.boxes:
                             cls = int(box.cls[0])
-                            label = str(weapon_model.names.get(cls, cls))
+                            label = str(weapon_names.get(cls, cls))
                             label_norm = str(label).strip().lower()
                             # Roboflow exports sometimes contain placeholder labels like '-' or 'undefined'.
                             # If we have a verification model configured, we can still use these boxes
@@ -1117,6 +1240,14 @@ class StreamWorker:
                 # This draws a person-sized box labeled "PERSON WITH GUN".
                 # It is intentionally gated heavily to reduce false positives.
                 if (not weapon_primary_ready) and (weapon_fallback_model is not None):
+                    assert weapon_fallback_model is not None
+                    fallback_names: Dict[int, str] = {}
+                    try:
+                        fn = getattr(weapon_fallback_model, "names", None)
+                        if isinstance(fn, dict):
+                            fallback_names = {int(k): str(v) for k, v in fn.items()}
+                    except Exception:
+                        fallback_names = {}
                     fallback_candidates.clear()
                     expanded_people = _expanded_person_boxes(pad_ratio=0.15)
                     run_fallback = (frame_index % self._weapon_infer_every_n_frames) == 0
@@ -1135,7 +1266,7 @@ class StreamWorker:
                     for fr in fb_results:
                         for box in fr.boxes:
                             cls = int(box.cls[0])
-                            raw_label = str(weapon_fallback_model.names.get(cls, cls))
+                            raw_label = str(fallback_names.get(cls, cls))
                             label_norm = str(raw_label).strip().lower()
                             if label_norm in {"-", "undefined", "background"}:
                                 continue
@@ -1230,6 +1361,14 @@ class StreamWorker:
                         if self._weapon_event_active:
                             return True
 
+                        verify_names: Dict[int, str] = {}
+                        try:
+                            vn = getattr(weapon_verify_model, "names", None)
+                            if isinstance(vn, dict):
+                                verify_names = {int(k): str(v) for k, v in vn.items()}
+                        except Exception:
+                            verify_names = {}
+
                         # Start/maintain a short verification window so a single bad frame
                         # doesn't permanently suppress a real weapon event.
                         if self._weapon_verify_pending_since is None:
@@ -1268,7 +1407,7 @@ class StreamWorker:
                         for vr in vres:
                             for box in vr.boxes:
                                 cls = int(box.cls[0])
-                                raw_label = str(weapon_verify_model.names.get(cls, cls))
+                                raw_label = str(verify_names.get(cls, cls))
                                 label_norm = str(raw_label).strip().lower()
 
                                 # Ignore placeholder labels and person-only outputs.
@@ -1494,36 +1633,68 @@ class StreamWorker:
                         unattended_bbox = (bx1, by1, bx2, by2)
                         break
 
-                if unattended_bbox is not None:
-                    bx1, by1, bx2, by2 = unattended_bbox
-                    cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
-                    cv2.putText(frame, "UNATTENDED BAG", (bx1, max(by1 - 10, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-                if unattended_bag:
+                if unattended_bag and unattended_bbox is not None:
+                    self._bag_last_seen_ts = now
+                    self._bag_last_bbox = unattended_bbox
                     if self._bag_start_time is None:
                         self._bag_start_time = now
-                    elif now - self._bag_start_time > self.BAG_THRESHOLD:
+
+                    bag_confirmed = (self._bag_start_time is not None) and ((now - self._bag_start_time) > self.BAG_THRESHOLD)
+
+                    # Only draw the overlay once the event is confirmed.
+                    # This avoids showing "UNATTENDED BAG" without an actual alert entry.
+                    if bag_confirmed:
+                        bx1, by1, bx2, by2 = unattended_bbox
+                        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
+                        cv2.putText(
+                            frame,
+                            "UNATTENDED BAG",
+                            (bx1, max(by1 - 10, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 0, 255),
+                            2,
+                        )
+
+                        bag_bbox = unattended_bbox
 
                         def _bag_snapshot() -> str | None:
-                            if unattended_bbox is None:
-                                return None
-                            return self._save_snapshot_jpeg(frame_clean, unattended_bbox, alert_type="bag", now=now)
+                            return self._save_snapshot_jpeg(frame_clean, bag_bbox, alert_type="bag", now=now)
 
                         self._emit_alert(
                             add_alert,
                             "Unattended Bag",
-                            "Suspicious item detected",
+                            "Unattended bag detected",
                             cooldown_s=10.0,
                             severity="High",
                             snapshot_provider=_bag_snapshot,
                         )
-                        self._bag_start_time = now
                 else:
-                    self._bag_start_time = None
+                    # If bags are present but *all* are near a person, consider the situation "attended"
+                    # and reset immediately. If no bags are detected at all, allow a short grace period
+                    # so brief detector dropouts don't prevent the alert from ever confirming.
+                    bags_present = bool(bags)
+                    if bags_present:
+                        self._bag_start_time = None
+                        self._bag_last_seen_ts = None
+                        self._bag_last_bbox = None
+                    else:
+                        last_seen = self._bag_last_seen_ts
+                        if last_seen is None or (now - last_seen) > float(self.BAG_MISSING_GRACE_SECONDS):
+                            self._bag_start_time = None
+                            self._bag_last_seen_ts = None
+                            self._bag_last_bbox = None
 
                 # Zones overlay + zone alerts
                 zones = self.get_zones()
                 if zones:
+                    persons_with_pid: list[tuple[int, int, int, int, int, int, int]] = []
+                    for i, (px1, py1, px2, py2, pcx, pcy) in enumerate(persons):
+                        pid = person_ids_by_index.get(i)
+                        # Fallback to a stable-ish ID for this frame.
+                        pid_i = int(pid) if pid is not None else int(i)
+                        persons_with_pid.append((px1, py1, px2, py2, pcx, pcy, pid_i))
+
                     observed_zone_ids: set[str] = set()
                     for z in zones:
                         zid = str(z.id)
@@ -1535,17 +1706,66 @@ class StreamWorker:
                         cv2.rectangle(frame, (zx1, zy1), (zx2, zy2), (255, 0, 255), 2)
                         cv2.putText(frame, z.name, (zx1, max(zy1 - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-                        in_zone = any(zx1 <= pcx <= zx2 and zy1 <= pcy <= zy2 for (_, _, _, _, pcx, pcy) in persons)
-                        if in_zone:
+                        severity_raw = str(z.severity or "medium").strip().lower() or "medium"
+                        is_restricted = severity_raw in {"critical", "high"}
+
+                        inside_persons = [p for p in persons_with_pid if zx1 <= p[4] <= zx2 and zy1 <= p[5] <= zy2]
+                        in_zone = bool(inside_persons)
+
+                        if in_zone and is_restricted:
+                            prev_ids = self._zone_prev_person_ids.get(zid, set())
+                            current_ids = {p[6] for p in inside_persons}
+                            entered_ids = current_ids - prev_ids
+
+                            if entered_ids:
+                                entered_pid = next(iter(entered_ids))
+                                sev = severity_raw.capitalize()
+
+                                def _zone_entry_snapshot() -> str | None:
+                                    for (px1, py1, px2, py2, _, _, pid_i) in inside_persons:
+                                        if pid_i == entered_pid:
+                                            return self._save_snapshot_jpeg(
+                                                frame_clean,
+                                                (px1, py1, px2, py2),
+                                                alert_type="zone-entry",
+                                                now=now,
+                                            )
+                                    # Fallback: crop any person in the zone.
+                                    for (px1, py1, px2, py2, _, _, _) in inside_persons:
+                                        return self._save_snapshot_jpeg(
+                                            frame_clean,
+                                            (px1, py1, px2, py2),
+                                            alert_type="zone-entry",
+                                            now=now,
+                                        )
+                                    return None
+
+                                self._emit_alert(
+                                    add_alert,
+                                    "Zone",  # keep type stable for the UI
+                                    f"{z.name}: restricted zone entry detected",
+                                    cooldown_s=self._zone_cooldown_s,
+                                    severity=sev,
+                                    snapshot_provider=_zone_entry_snapshot,
+                                )
+
+                            # Always update after processing to avoid repeated entry alerts.
+                            self._zone_prev_person_ids[zid] = current_ids
+
+                            # Keep dwell timer state clean for restricted zones.
+                            self._zone_presence_start.pop(zid, None)
+
+                        elif in_zone:
+                            # Non-restricted: dwell-based zone alerting
                             start = self._zone_presence_start.get(zid)
                             if start is None:
                                 self._zone_presence_start[zid] = now
                             elif (now - start) >= self._zone_dwell_seconds:
-                                sev = (z.severity or "medium").capitalize()
+                                sev = severity_raw.capitalize()
 
                                 def _zone_snapshot() -> str | None:
                                     # Find a person currently in the zone and crop them.
-                                    for (px1, py1, px2, py2, pcx, pcy) in persons:
+                                    for (px1, py1, px2, py2, pcx, pcy, _) in persons_with_pid:
                                         if zx1 <= pcx <= zx2 and zy1 <= pcy <= zy2:
                                             return self._save_snapshot_jpeg(
                                                 frame_clean,
@@ -1565,13 +1785,19 @@ class StreamWorker:
                                 )
                                 # reset dwell timer so it requires re-dwell after an alert
                                 self._zone_presence_start[zid] = now
+
                         else:
                             self._zone_presence_start.pop(zid, None)
+                            self._zone_prev_person_ids.pop(zid, None)
 
                     # Prune state for zones no longer configured
                     for zid in list(self._zone_presence_start.keys()):
                         if zid not in observed_zone_ids:
                             self._zone_presence_start.pop(zid, None)
+
+                    for zid in list(self._zone_prev_person_ids.keys()):
+                        if zid not in observed_zone_ids:
+                            self._zone_prev_person_ids.pop(zid, None)
 
                 # Encode JPEG and publish
                 ok, buf = cv2.imencode(
@@ -1689,7 +1915,8 @@ class StreamManager:
         self._weapon_verify_cooldown_s = _env_float("INTENTWATCH_WEAPON_VERIFY_COOLDOWN_SECONDS", 2.0)
         self._weapon_verify_retry_s = _env_float("INTENTWATCH_WEAPON_VERIFY_RETRY_SECONDS", 0.4)
         self._weapon_verify_window_s = _env_float("INTENTWATCH_WEAPON_VERIFY_WINDOW_SECONDS", 1.5)
-        self._weapon_verify_required = _env_bool("INTENTWATCH_WEAPON_VERIFY_REQUIRED", False)
+        # If a verify model is configured, requiring verification significantly reduces false positives.
+        self._weapon_verify_required = _env_bool("INTENTWATCH_WEAPON_VERIFY_REQUIRED", True)
 
         allow_person_labels_raw = str(os.getenv("INTENTWATCH_WEAPON_ALLOW_PERSON_LABELS", "0")).strip().lower()
         self._weapon_allow_person_labels = allow_person_labels_raw in {"1", "true", "yes", "y", "on"}
@@ -1716,7 +1943,9 @@ class StreamManager:
         self._weapon_imgsz = _env_int("INTENTWATCH_WEAPON_IMGSZ", 960)
         self._infer_half = _env_bool("INTENTWATCH_INFER_HALF", False)
         self._max_frame_height = _env_int("INTENTWATCH_MAX_FRAME_HEIGHT", 720)
-        self._file_max_frame_height = _env_int("INTENTWATCH_FILE_MAX_FRAME_HEIGHT", 1080)
+        # Uploaded files are often 1080p+; downscaling improves stream smoothness substantially on CPU.
+        # Users can override via env if they need higher-res processing.
+        self._file_max_frame_height = _env_int("INTENTWATCH_FILE_MAX_FRAME_HEIGHT", 540)
         self._jpeg_quality = _env_int("INTENTWATCH_JPEG_QUALITY", 80)
         self._weapon_infer_every_n_frames = _env_int("INTENTWATCH_WEAPON_INFER_EVERY_N_FRAMES", 1)
 
@@ -1926,7 +2155,12 @@ class StreamManager:
                 return None
             try:
                 m = mh.get_optional()
-                return dict(m.names) if m is not None else None
+                if m is None:
+                    return None
+                names = getattr(m, "names", None)
+                if not isinstance(names, dict):
+                    return None
+                return {int(k): str(v) for k, v in names.items()}
             except Exception:
                 return None
 

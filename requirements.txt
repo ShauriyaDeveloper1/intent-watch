@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 opencv-python
-numpy
+numpy<2
 ultralytics
 deep-sort-realtime
 playsound==1.2.2

@@ -1,0 +1,24 @@
+# IntentWatch backend - GPU requirements (CUDA 12.4)
+#
+# This file is intended for Windows + NVIDIA GPUs.
+# It pins NumPy < 2 to keep OpenCV wheels compatible.
+#
+# Install:
+#   python -m pip install -r backend/requirements-gpu-cu124.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.7
+python-dotenv>=1.0.0
+opencv-python==4.9.0.80
+numpy<2
+
+# CUDA builds (match Torch 2.5.1)
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+torchaudio==2.5.1+cu124
+
+ultralytics==8.1.0
+supabase>=2.3.0

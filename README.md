@@ -168,6 +168,9 @@ IntentWatch/
 - `GET /alerts/analytics` - Get analytics data
 - `POST /alerts/clear` - Clear all alerts
 
+### IoT
+- `POST /iot/door` - Report door open/close/tamper events (ESP8266, etc.)
+
 ## Configuration
 
 ### Backend Configuration

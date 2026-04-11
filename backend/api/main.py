@@ -19,7 +19,7 @@ try:  # pragma: no cover
 except Exception:
     pass
 
-from api.routes import video, alerts, metrics, history
+from api.routes import video, alerts, metrics, history, iot, ask, demo
 
 
 def _parse_csv_env(name: str) -> list[str]:
@@ -63,6 +63,9 @@ app.include_router(video.router, prefix="/video", tags=["Video"])
 app.include_router(alerts.router, prefix="/alerts", tags=["Alerts"])
 app.include_router(history.router, prefix="/history", tags=["History"])
 app.include_router(metrics.router, tags=["Metrics"])
+app.include_router(iot.router, prefix="/iot", tags=["IoT"])
+app.include_router(ask.router, tags=["AI"])
+app.include_router(demo.router, prefix="/demo", tags=["Demo"])
 
 
 @app.on_event("startup")
