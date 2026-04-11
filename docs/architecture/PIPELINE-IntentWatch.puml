@@ -1,0 +1,97 @@
+@startuml
+' IntentWatch End-to-End Pipeline (PlantUML)
+' Render with VS Code PlantUML extension.
+
+hide empty description
+skinparam shadowing false
+skinparam backgroundColor transparent
+skinparam defaultFontName Arial
+skinparam defaultFontSize 12
+
+skinparam rectangle {
+  RoundCorner 10
+}
+
+skinparam ArrowColor #4b5563
+skinparam ArrowThickness 1
+skinparam ArrowFontColor #111827
+
+skinparam NoteBackgroundColor #fff7ed
+skinparam NoteBorderColor #fb923c
+
+title IntentWatch — Real-time CV Alerting Pipeline
+
+' --- Sources ---
+cloud "CCTV / IP Camera\n(RTSP/HTTP)" as cam
+rectangle "Local Video File\n(.mp4)" as file
+
+rectangle "OpenCV Capture\n- connect/reconnect\n- decode frames" as capture
+rectangle "Pre-processing\n- resize\n- optional zones normalize" as pre
+
+' --- Inference ---
+rectangle "YOLO Detection\n(Ultralytics)" as yolo
+rectangle "Detections\n(person / bag / weapon)" as det
+
+rectangle "Contextual Plausibility\n- near-person check\n- size/area guards\n- class thresholds" as plaus
+rectangle "Temporal Persistence\n- streak counters\n- cooldown/rearm\n- event active gating" as persist
+
+rectangle "Optional Weapon Verification\n(second-stage YOLO)" as verify
+
+' --- Event Intelligence ---
+rectangle "Behavior Analytics\n- running (speed history)\n- loitering\n- unattended bag\n- zone dwell timers" as behavior
+
+rectangle "Alert Decision\n- merge signals\n- severity/type\n- snapshot selection" as decide
+
+' --- Delivery ---
+rectangle "Alert Store (in-memory)\nactive + history" as alertstore
+rectangle "FastAPI API\n/alerts /metrics /history" as api
+rectangle "Frontend Dashboard\n(React + Vite)" as ui
+
+rectangle "Evidence Writer\n- clips (rotating)\n- snapshots\n- sidecar metadata" as evidence
+
+cloud "Optional Cloud Storage\n(Supabase)" as supabase
+rectangle "Optional Notifications\n(Telegram)" as notify
+
+' --- Flows ---
+cam --> capture : video stream
+file --> capture : offline input
+capture --> pre : frames
+pre --> yolo : tensor/image
+
+yolo --> det : boxes + scores
+
+det --> plaus : candidates
+plaus --> persist : filtered candidates
+persist --> verify : needs confirmation (optional)
+verify --> persist : verified weapon / reject
+
+persist --> behavior : person tracks / state
+behavior --> decide
+persist --> decide
+
+decide --> alertstore : push alert
+alertstore --> api : serve JSON
+api --> ui : polling / live feed
+
+pre --> evidence : annotated frame
+persist --> evidence : event start/stop
+behavior --> evidence : dwell/behavior evidence
+
+evidence --> api : /history listing + playback
+
+evidence --> supabase : upload (optional)
+alertstore --> notify : send message (optional)
+
+note right of persist
+Key safety mechanisms:
+- persistence reduces flicker
+- cooldown prevents spam
+- "event active" requires clear frames
+end note
+
+note bottom of evidence
+History assets are stored locally by stream+date.
+Uploads (if configured) are best-effort.
+end note
+
+@enduml

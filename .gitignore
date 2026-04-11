@@ -62,6 +62,10 @@ logs/
 # Any datasets folder checked into the workspace during experiments
 /datasets/
 
+# Local demo artifacts
+/Dataset/
+/demo_test.jpg
+
 # Local model weights copied into workspace root (backend has its own)
 /yolov8n.pt
 /yolov8s.pt

@@ -1,0 +1,40 @@
+@startuml
+' IntentWatch - C4 Container Diagram
+'
+' If your PlantUML preview cannot fetch remote includes, comment the URL include
+' and uncomment the local include line below.
+'
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+' !include ./c4/C4_Container.puml
+
+title IntentWatch - C4 Container Diagram
+
+Person(user, "Operator", "Uses the surveillance dashboard to monitor live feed and alerts.")
+
+Container_Ext(doorSensor, "Door Sensor Node", "ESP8266 + Reed Switch", "Detects door open/tamper and posts events to the backend.")
+
+System_Boundary(intentwatch, "IntentWatch") {
+
+  Container(frontend, "Frontend Web App", "React + Vite (TypeScript)", "Provides UI: Live Feed, Dashboard, Alerts Log, Analytics.")
+  Container(backend, "Backend API", "FastAPI (Python)", "REST API for video control, alerts, history, and metrics. Orchestrates AI pipeline.")
+
+  Container(ai, "Vision / AI Pipeline", "OpenCV + YOLOv8 + DeepSORT", "Reads frames, performs detection + tracking, generates events (alerts) and snapshots.")
+  ContainerDb(localfs, "Local Data Storage", "Filesystem", "Stores uploaded videos, snapshots/snaps, and alert/history artifacts.")
+
+  Container_Ext(supabase, "Supabase (optional)", "Supabase", "Optional external storage/notifications/integration when configured.")
+}
+
+Rel(user, frontend, "Uses", "HTTP(S)")
+Rel(frontend, backend, "Calls REST API", "HTTP (localhost:8000)")
+
+Rel(doorSensor, backend, "Posts door events", "HTTP (WiFi)")
+
+Rel(backend, ai, "Invokes processing", "in-process calls")
+Rel(ai, localfs, "Writes media + logs", "file I/O")
+Rel(backend, localfs, "Reads/Writes history & artifacts", "file I/O")
+
+Rel(backend, supabase, "Sends/reads data (optional)", "HTTPS")
+
+LAYOUT_LEFT_RIGHT()
+
+@enduml

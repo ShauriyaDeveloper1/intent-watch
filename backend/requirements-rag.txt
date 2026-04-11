@@ -1,0 +1,6 @@
+# Optional dependencies for the /ask RAG endpoint.
+#
+# These are intentionally kept separate from backend/requirements.txt so the core
+# app can run without downloading large ML/NLP models.
+
+sentence-transformers>=2.6.0

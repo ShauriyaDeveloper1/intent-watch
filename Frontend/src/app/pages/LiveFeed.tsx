@@ -241,7 +241,7 @@ export function LiveFeed() {
       try {
         const data = await alertsAPI.getLiveAlerts();
         if (isMountedRef.current) {
-          const next = Array.isArray(data) ? data.slice(-5) : [];
+          const next = Array.isArray(data) ? data.slice(-50) : [];
           setAlerts(next);
         }
       } catch {
@@ -250,9 +250,10 @@ export function LiveFeed() {
     };
 
     fetchAlerts();
-    const interval = window.setInterval(fetchAlerts, 500);
+    const intervalMs = isStreaming ? 1000 : 2500;
+    const interval = window.setInterval(fetchAlerts, intervalMs);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [isStreaming]);
 
   const handleStartStopPrimary = async () => {
     setIsLoading(true);

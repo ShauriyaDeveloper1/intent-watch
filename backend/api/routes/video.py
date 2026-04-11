@@ -24,6 +24,24 @@ VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_CANDIDATES = [BACKEND_DIR / "yolov8n.pt"]
 
 
+def _demo_mode_enabled() -> bool:
+    v = os.getenv("INTENTWATCH_DEMO_MODE")
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _raise_demo_mode_blocked() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Demo mode is enabled (INTENTWATCH_DEMO_MODE=1). "
+            "Real-time streaming is disabled for reliability. "
+            "Use POST /demo/detect-image (or /demo/warmup) instead."
+        ),
+    )
+
+
 def _sorted_checkpoints(root: Path, *, max_items: int = 20) -> list[Path]:
     """Return best.pt checkpoints under root sorted newest-first."""
     if not root.exists():
@@ -302,6 +320,9 @@ def _open_capture_for_validation(source: int):
 def upload_video(file: UploadFile = File(...)):
     """Upload and validate video file"""
     try:
+        if _demo_mode_enabled():
+            _raise_demo_mode_blocked()
+
         if not file.filename:
             raise HTTPException(status_code=400, detail="No filename provided")
         
@@ -349,6 +370,9 @@ def upload_video(file: UploadFile = File(...)):
 def start_camera(body: StartCameraRequest | None = None):
     """Start live camera feed"""
     try:
+        if _demo_mode_enabled():
+            _raise_demo_mode_blocked()
+
         # If user has configured an IP Webcam URL, prefer it.
         webcam_url = str(os.getenv("INTENTWATCH_WEBCAM_URL") or "").strip()
         if webcam_url:
@@ -377,6 +401,8 @@ def start_camera(body: StartCameraRequest | None = None):
         manager.start(PRIMARY_STREAM_ID, src, mode="camera")
         print("✓ IP webcam selected successfully")
         return {"message": "IP webcam selected", "source": src}
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"✗ Camera error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Camera error: {str(e)}")
@@ -394,6 +420,9 @@ def start_video(body: StartVideoRequest):
     """
     if body is None or not body.source:
         raise HTTPException(status_code=400, detail="Missing source")
+
+    if _demo_mode_enabled():
+        _raise_demo_mode_blocked()
 
     source_raw = str(body.source).strip()
     try:
@@ -474,6 +503,9 @@ def debug_models():
 def start_stream(body: StartStreamRequest):
     if body is None or not body.stream_id or not body.source:
         raise HTTPException(status_code=400, detail="Missing stream_id or source")
+
+    if _demo_mode_enabled():
+        _raise_demo_mode_blocked()
 
     stream_id = str(body.stream_id).strip()
     if not stream_id:
