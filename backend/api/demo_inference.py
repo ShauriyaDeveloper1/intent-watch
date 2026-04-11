@@ -7,7 +7,8 @@ import threading
 import time
 
 import numpy as np
-from ultralytics import YOLO
+
+from api.torch_compat import apply_torch_load_weights_only_default_false
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -106,16 +107,23 @@ class DemoModelInfo:
 
 
 _model_lock = threading.Lock()
-_demo_model: YOLO | None = None
+_demo_model: object | None = None
 _demo_info: DemoModelInfo | None = None
 
 
-def get_demo_model() -> tuple[YOLO, DemoModelInfo]:
+def get_demo_model() -> tuple[object, DemoModelInfo]:
     """Load and cache the demo YOLO model once per process."""
     global _demo_model, _demo_info
     with _model_lock:
         if _demo_model is not None and _demo_info is not None:
             return _demo_model, _demo_info
+
+        # Ensure torch.load can load Ultralytics checkpoints in environments
+        # where weights_only=True is the default (e.g., some Colab runtimes).
+        apply_torch_load_weights_only_default_false()
+
+        # Lazy import so torch patch is applied before Ultralytics loads weights.
+        from ultralytics import YOLO
 
         model_path = pick_demo_model_path()
         device = _default_device()

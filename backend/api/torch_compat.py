@@ -36,7 +36,10 @@ def apply_torch_load_weights_only_default_false() -> None:
         return
 
     def patched(*args: Any, **kwargs: Any):
-        kwargs.setdefault("weights_only", False)
+        # In PyTorch 2.6 some environments default weights_only=True.
+        # Ultralytics checkpoints often require full unpickling.
+        # For IntentWatch demos we assume checkpoints are trusted and force False.
+        kwargs["weights_only"] = False
         return original(*args, **kwargs)
 
     setattr(patched, "__intentwatch_patched__", True)
