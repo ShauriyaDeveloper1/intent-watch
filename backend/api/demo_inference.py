@@ -7,7 +7,8 @@ import threading
 import time
 
 import numpy as np
-from ultralytics import YOLO
+
+from api.torch_compat import apply_torch_load_weights_only_default_false
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -106,16 +107,23 @@ class DemoModelInfo:
 
 
 _model_lock = threading.Lock()
-_demo_model: YOLO | None = None
+_demo_model: object | None = None
 _demo_info: DemoModelInfo | None = None
 
 
-def get_demo_model() -> tuple[YOLO, DemoModelInfo]:
+def get_demo_model() -> tuple[object, DemoModelInfo]:
     """Load and cache the demo YOLO model once per process."""
     global _demo_model, _demo_info
     with _model_lock:
         if _demo_model is not None and _demo_info is not None:
             return _demo_model, _demo_info
+
+        # Ensure torch.load can load Ultralytics checkpoints in environments
+        # where weights_only=True is the default (e.g., some Colab runtimes).
+        apply_torch_load_weights_only_default_false()
+
+        # Lazy import so torch patch is applied before Ultralytics loads weights.
+        from ultralytics import YOLO
 
         model_path = pick_demo_model_path()
         device = _default_device()
@@ -130,6 +138,30 @@ def get_demo_model() -> tuple[YOLO, DemoModelInfo]:
 def warmup_demo_model(*, imgsz: int = 640, conf: float = 0.25) -> dict:
     model, info = get_demo_model()
 
+    torch_version = None
+    cuda_available = None
+    cuda_device_name = None
+    try:
+        import torch
+
+        torch_version = getattr(torch, "__version__", None)
+        cuda_available = bool(torch.cuda.is_available())
+        if cuda_available:
+            try:
+                cuda_device_name = torch.cuda.get_device_name(0)
+            except Exception:
+                cuda_device_name = None
+    except Exception:
+        pass
+
+    ultralytics_version = None
+    try:
+        import ultralytics
+
+        ultralytics_version = getattr(ultralytics, "__version__", None)
+    except Exception:
+        pass
+
     # Small dummy image warmup (helps first-run latency on GPU).
     dummy = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
     t0 = time.perf_counter()
@@ -141,4 +173,8 @@ def warmup_demo_model(*, imgsz: int = 640, conf: float = 0.25) -> dict:
         "model_path": info.model_path,
         "device": info.device,
         "warmup_ms": round(dt_ms, 2),
+        "torch_version": torch_version,
+        "cuda_available": cuda_available,
+        "cuda_device_name": cuda_device_name,
+        "ultralytics_version": ultralytics_version,
     }
