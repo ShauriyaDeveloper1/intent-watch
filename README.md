@@ -317,6 +317,14 @@ INTENTWATCH_PHONE_ALERT_TYPES=weapon,unattended bag
 
 Telegram forwarding is opt-in and should be configured only on the backend.
 
+### Ask AI RAG flow (optional)
+
+The `POST /ask` endpoint uses an optional retrieval-augmented flow around recent backend context:
+
+- **Retrieved context:** a snapshot of recent in-memory alerts (up to `max_alerts`, default 1000). For questions mentioning history clips/video/footage, recent local history clip metadata is also appended.
+- **Retrieval strategy:** in-memory top-`k` retrieval (default 5) using embedding similarity when `sentence-transformers` is installed (`backend/requirements-rag.txt`), otherwise lexical overlap scoring. If retrieval returns no matches but alerts exist, it falls back to the most recent alerts.
+- **Answer generation:** optional provider-based generation with OpenAI or Ollama; if no provider response is available, the endpoint returns an extractive answer built directly from retrieved alert context.
+
 ### Optional Ask AI providers
 
 ```dotenv
